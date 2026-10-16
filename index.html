@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video → RGBA frames + MP3</title>
+<style>
+  :root { --bg:#14161a; --card:#1d2026; --fg:#e8eaed; --mut:#9aa0a6; --acc:#4f8cff; --bd:#2c3038; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f4f5f7; --card:#fff; --fg:#1b1d21; --mut:#6b7280; --bd:#dcdfe4; } }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui,sans-serif; }
+  main { max-width:560px; margin:0 auto; display:grid; gap:12px; }
+  h1 { font-size:18px; margin:0; }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:10px; padding:12px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  label { display:grid; gap:4px; font-size:12px; color:var(--mut); }
+  input[type=number], input[type=file] { width:100%; padding:8px; border-radius:6px; border:1px solid var(--bd); background:var(--bg); color:var(--fg); font-size:14px; }
+  label.chk { display:flex; align-items:center; gap:8px; font-size:14px; color:var(--fg); }
+  button { padding:10px 14px; border:0; border-radius:8px; background:var(--acc); color:#fff; font-size:15px; cursor:pointer; }
+  button.sec { background:var(--bd); color:var(--fg); }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  progress { width:100%; height:10px; }
+  #info, #log { font-size:12px; color:var(--mut); white-space:pre-wrap; }
+  video { display:none; }
+  a.dl { display:inline-block; padding:8px 12px; border-radius:8px; background:var(--bd); color:var(--fg); text-decoration:none; font-size:14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Video → RGBA frames + MP3</h1>
+
+  <div class="card">
+    <label>Video file (mp4, webm, mov… anything your browser can play)
+      <input type="file" id="file" accept="video/*">
+    </label>
+    <div id="info"></div>
+  </div>
+
+  <div class="card">
+    <div class="grid">
+      <label>Width (px)<input type="number" id="width" value="256" min="8" max="1920"></label>
+      <label>Output FPS<input type="number" id="fps" value="40" min="1" max="120" step="0.01"></label>
+      <label>Start (s)<input type="number" id="start" value="0" min="0" step="0.1"></label>
+      <label>End (s, 0 = full)<input type="number" id="end" value="0" min="0" step="0.1"></label>
+      <label>Max frames (0 = no limit)<input type="number" id="maxFrames" value="0" min="0"></label>
+      <label>MP3 bitrate (kbps)<input type="number" id="bitrate" value="128" min="32" max="320" step="32"></label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label class="chk"><input type="checkbox" id="audio" checked> Extract audio</label>
+      <label class="chk"><input type="checkbox" id="mono"> Mono audio</label>
+    </div>
+    <div class="row" style="margin-top:10px;align-items:end">
+      <label class="chk"><input type="checkbox" id="dedupe" checked> Skip duplicate frames</label>
+      <label style="width:150px">Tolerance (0 = exact, 0–255)<input type="number" id="tol" value="1" min="0" max="255" step="0.1"></label>
+    </div>
+    <div id="est" style="margin-top:8px;font-size:12px;color:var(--mut)"></div>
+  </div>
+
+  <div class="row">
+    <button id="go" disabled>Convert</button>
+    <button id="stop" class="sec" disabled>Cancel</button>
+  </div>
+  <progress id="bar" value="0" max="1" hidden></progress>
+  <div id="log"></div>
+  <div class="row" id="out"></div>
+</main>
+
+<video id="v" muted playsinline preload="auto"></video>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js"></script>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const v = $('v');
+let fileObj = null, objUrl = null, cancelled = false;
+
+// ---------- helpers
+const val = id => +$(id).value;
+const even = n => Math.max(2, Math.round(n / 2) * 2);
+const log = t => { $('log').textContent = t; };
+const mb = b => (b / 1048576).toFixed(1) + ' MB';
+
+function dims() {
+  const w = even(val('width')) , h = even(w * v.videoHeight / v.videoWidth);
+  return { w, h };
+}
+function range() {
+  const start = Math.max(0, val('start'));
+  let end = val('end'); if (!(end > start) || end > v.duration) end = v.duration;
+  return { start, end };
+}
+function frameTotal() {
+  const { start, end } = range();
+  let n = Math.floor((end - start) * val('fps'));
+  const m = Math.floor(val('maxFrames')); if (m > 0) n = Math.min(n, m);
+  return Math.max(0, n);
+}
+function estimate() {
+  if (!v.videoWidth) return;
+  const { w, h } = dims(), n = frameTotal();
+  $('est').textContent = `${w}×${h}, ${n} frames, ~${mb(w * h * 4 * n)} raw RGBA`;
+}
+['width','fps','start','end','maxFrames'].forEach(id => $(id).addEventListener('input', estimate));
+
+// ---------- load
+$('file').addEventListener('change', e => {
+  fileObj = e.target.files[0]; if (!fileObj) return;
+  if (objUrl) URL.revokeObjectURL(objUrl);
+  objUrl = URL.createObjectURL(fileObj);
+  $('go').disabled = true; $('out').innerHTML = '';
+  v.src = objUrl;
+});
+v.addEventListener('loadedmetadata', () => {
+  $('info').textContent = `${fileObj.name} · ${v.videoWidth}×${v.videoHeight} · ${v.duration.toFixed(2)}s · ${mb(fileObj.size)}`;
+  $('go').disabled = false; estimate();
+});
+v.addEventListener('error', () => log('Browser cannot decode this video.'));
+
+// ---------- frames
+const seek = t => new Promise(res => {
+  const done = () => { v.removeEventListener('seeked', done); res(); };
+  v.addEventListener('seeked', done);
+  v.currentTime = t;
+});
+
+// mean abs RGB difference <= tol (0 = exact match); aborts early once it can't pass
+function similar(a, b, tol) {
+  const limit = tol * (a.length / 4) * 3;
+  let sum = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    sum += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+    if (sum > limit) return false;
+  }
+  return true;
+}
+
+async function extractFrames(onProgress) {
+  const { w, h } = dims(), { start } = range(), fps = val('fps'), total = frameTotal();
+  const cv = new OffscreenCanvas(w, h);
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  const frameBytes = w * h * 4;
+  const dedupe = $('dedupe').checked, tol = Math.max(0, val('tol'));
+  const map = new Uint32Array(total); // timeline frame -> unique frame index
+  const blobs = []; let batch = [];
+  let n = 0, unique = 0, prev = null;
+  for (; n < total; n++) {
+    if (cancelled) throw new Error('cancelled');
+    await seek(start + n / fps + 0.0005);
+    ctx.drawImage(v, 0, 0, w, h);
+    const px = ctx.getImageData(0, 0, w, h).data; // Uint8ClampedArray, RGBA
+    if (dedupe && prev && similar(prev, px, tol)) {
+      map[n] = unique - 1; // reuse the last kept frame
+    } else {
+      map[n] = unique++;
+      prev = px;
+      batch.push(px);
+      if (batch.length >= 64) { blobs.push(new Blob(batch)); batch = []; } // lets the browser move data off the JS heap
+    }
+    if (n % 4 === 0) { onProgress(n / total); await new Promise(r => setTimeout(r)); }
+  }
+  if (batch.length) blobs.push(new Blob(batch));
+  return { blob: new Blob(blobs), width: w, height: h, count: n, unique, map, frameBytes };
+}
+
+// ---------- audio -> mp3
+async function extractMp3() {
+  const sr = 44100;
+  const ac = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sr });
+  let buf;
+  try { buf = await ac.decodeAudioData(await fileObj.arrayBuffer()); }
+  catch { await ac.close(); return null; } // no audio track / undecodable
+  await ac.close();
+  const { start } = range(), fps = val('fps');
+  const frames = frameTotal();
+  const endT = Math.min(range().end, start + frames / fps);
+  const a = Math.floor(start * sr), b = Math.min(buf.length, Math.floor(endT * sr));
+  if (b <= a) return null;
+  const mono = $('mono').checked || buf.numberOfChannels === 1;
+  const ch = mono ? 1 : 2;
+  const L = buf.getChannelData(0).subarray(a, b);
+  const R = mono ? null : buf.getChannelData(Math.min(1, buf.numberOfChannels - 1)).subarray(a, b);
+  const enc = new lamejs.Mp3Encoder(ch, sr, Math.max(32, Math.min(320, Math.round(val('bitrate')))));
+  const toI16 = (src, i, n, m) => {
+    const o = new Int16Array(n);
+    for (let k = 0; k < n; k++) {
+      let s = src[i + k];
+      if (m) s = (s + m[i + k]) / 2;
+      o[k] = Math.max(-1, Math.min(1, s)) * 32767;
+    }
+    return o;
+  };
+  const parts = [], BLOCK = 1152 * 20;
+  for (let i = 0; i < L.length; i += BLOCK) {
+    if (cancelled) throw new Error('cancelled');
+    const n = Math.min(BLOCK, L.length - i);
+    const out = mono
+      ? enc.encodeBuffer(toI16(L, i, n, buf.numberOfChannels > 1 && $('mono').checked ? buf.getChannelData(1).subarray(a, b) : null))
+      : enc.encodeBuffer(toI16(L, i, n), toI16(R, i, n));
+    if (out.length) parts.push(new Uint8Array(out));
+    if ((i / BLOCK) % 10 === 0) await new Promise(r => setTimeout(r));
+  }
+  const tail = enc.flush(); if (tail.length) parts.push(new Uint8Array(tail));
+  return new Blob(parts, { type: 'audio/mpeg' });
+}
+
+// ---------- run
+function addDl(blob, name) {
+  const a = document.createElement('a');
+  a.className = 'dl'; a.href = URL.createObjectURL(blob); a.download = name;
+  a.textContent = `${name} (${mb(blob.size)})`;
+  $('out').appendChild(a);
+}
+
+$('go').addEventListener('click', async () => {
+  cancelled = false; $('out').innerHTML = '';
+  $('go').disabled = true; $('stop').disabled = false; $('bar').hidden = false; $('bar').value = 0;
+  try {
+    const total = frameTotal();
+    if (!total) throw new Error('No frames in the selected range.');
+    const t0 = performance.now();
+    const fr = await extractFrames(p => { $('bar').value = p; log(`Extracting frames… ${(p * 100).toFixed(0)}%`); });
+
+    let audio = null;
+    if ($('audio').checked) { log('Encoding MP3…'); $('bar').removeAttribute('value'); audio = await extractMp3(); }
+
+    const meta = {
+      format: 'rgba8', width: fr.width, height: fr.height,
+      count: fr.count,            // timeline frames (duration = count / fps)
+      uniqueCount: fr.unique,     // frames actually stored in frames.rgba
+      hasMap: fr.unique < fr.count, // true -> map.bin (u32 LE per timeline frame -> 0-based unique index)
+      frameBytes: fr.frameBytes, fps: val('fps'),
+      hasAudio: !!audio, audioBytes: audio ? audio.size : 0, bitrate: Math.round(val('bitrate')),
+    };
+    addDl(fr.blob, 'frames.rgba');
+    if (audio) addDl(audio, 'audio.mp3');
+    if (meta.hasMap) addDl(new Blob([fr.map.buffer]), 'map.bin'); // Uint32Array, little-endian
+    addDl(new Blob([JSON.stringify(meta)], { type: 'application/json' }), 'meta.json');
+    log(`Done in ${((performance.now() - t0) / 1000).toFixed(1)}s · ${fr.count} timeline frames, ${fr.unique} stored (${fr.width}×${fr.height})` +
+        (audio ? '' : $('audio').checked ? ' · no audio track found' : ''));
+  } catch (e) {
+    log(e.message === 'cancelled' ? 'Cancelled.' : 'Error: ' + e.message);
+  } finally {
+    $('go').disabled = false; $('stop').disabled = true; $('bar').hidden = true;
+  }
+});
+$('stop').addEventListener('click', () => { cancelled = true; });
+</script>
+</body>
+</html>
