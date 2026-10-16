@@ -168,12 +168,12 @@ async function extractFrames(onProgress) {
 
 // ---------- audio -> mp3
 async function extractMp3() {
-  const sr = 44100;
-  const ac = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sr });
+  const ac = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
   let buf;
   try { buf = await ac.decodeAudioData(await fileObj.arrayBuffer()); }
   catch { await ac.close(); return null; } // no audio track / undecodable
   await ac.close();
+  const sr = buf.sampleRate; // some browsers ignore the requested rate; using the real one keeps speed/length correct
   const { start } = range(), fps = val('fps');
   const frames = frameTotal();
   const endT = Math.min(range().end, start + frames / fps);
@@ -207,6 +207,49 @@ async function extractMp3() {
   return new Blob(parts, { type: 'audio/mpeg' });
 }
 
+// ---------- ZIP (store-only, no compression, no library)
+const CRC_T = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t;
+})();
+async function crc32(blob) {
+  let c = 0xFFFFFFFF;
+  const r = blob.stream().getReader();
+  for (;;) {
+    const { done, value } = await r.read(); if (done) break;
+    for (let i = 0; i < value.length; i++) c = CRC_T[(c ^ value[i]) & 255] ^ (c >>> 8);
+  }
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+async function makeZip(files) {
+  const enc = new TextEncoder(), d = new Date();
+  const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  const dosDate = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  const parts = [], central = []; let offset = 0, cdSize = 0;
+  for (const f of files) {
+    const size = f.blob.size;
+    if (size > 0xFFFF0000 || offset + size > 0xFFFF0000) throw new Error('Too large for a ZIP (4 GB limit). Lower width, FPS or length.');
+    const crc = await crc32(f.blob), name = enc.encode(f.name);
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); lh.setUint16(8, 0, true);
+    lh.setUint16(10, dosTime, true); lh.setUint16(12, dosDate, true); lh.setUint32(14, crc, true);
+    lh.setUint32(18, size, true); lh.setUint32(22, size, true); lh.setUint16(26, name.length, true); lh.setUint16(28, 0, true);
+    parts.push(lh.buffer, name, f.blob);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true);
+    ch.setUint16(10, 0, true); ch.setUint16(12, dosTime, true); ch.setUint16(14, dosDate, true); ch.setUint32(16, crc, true);
+    ch.setUint32(20, size, true); ch.setUint32(24, size, true); ch.setUint16(28, name.length, true);
+    ch.setUint32(42, offset, true);
+    central.push(ch.buffer, name);
+    cdSize += 46 + name.length; offset += 30 + name.length + size;
+  }
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, end.buffer], { type: 'application/zip' });
+}
+
 // ---------- run
 function addDl(blob, name) {
   const a = document.createElement('a');
@@ -235,12 +278,16 @@ $('go').addEventListener('click', async () => {
       frameBytes: fr.frameBytes, fps: val('fps'),
       hasAudio: !!audio, audioBytes: audio ? audio.size : 0, bitrate: Math.round(val('bitrate')),
     };
-    addDl(fr.blob, 'frames.rgba');
-    if (audio) addDl(audio, 'audio.mp3');
-    if (meta.hasMap) addDl(new Blob([fr.map.buffer]), 'map.bin'); // Uint32Array, little-endian
-    addDl(new Blob([JSON.stringify(meta)], { type: 'application/json' }), 'meta.json');
+    const files = [{ name: 'frames.rgba', blob: fr.blob }];
+    if (audio) files.push({ name: 'audio.mp3', blob: audio });
+    if (meta.hasMap) files.push({ name: 'map.bin', blob: new Blob([fr.map.buffer]) }); // u32 little-endian
+    files.push({ name: 'meta.json', blob: new Blob([JSON.stringify(meta)], { type: 'application/json' }) });
+    log('Making ZIP…'); $('bar').removeAttribute('value');
+    addDl(await makeZip(files), 'video-data.zip');
+    files.forEach(f => addDl(f.blob, f.name));
     log(`Done in ${((performance.now() - t0) / 1000).toFixed(1)}s · ${fr.count} timeline frames, ${fr.unique} stored (${fr.width}×${fr.height})` +
-        (audio ? '' : $('audio').checked ? ' · no audio track found' : ''));
+        (audio ? '' : $('audio').checked ? ' · no audio track found' : '') +
+        (meta.hasMap ? '\nDuplicates were skipped: map.bin is inside the ZIP. If you save files one by one, save map.bin too.' : ''));
   } catch (e) {
     log(e.message === 'cancelled' ? 'Cancelled.' : 'Error: ' + e.message);
   } finally {
