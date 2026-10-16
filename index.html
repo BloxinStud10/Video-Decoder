@@ -31,7 +31,10 @@
   <h1>Video → RGBA frames + MP3</h1>
 
   <div class="card">
-    <label>Video file (mp4, webm, mov… anything your browser can play)
+    <label>Choose from Files / Downloads (mp4, webm, mov…)
+      <input type="file" id="fileAny">
+    </label>
+    <label style="margin-top:8px">Or pick from Photo gallery
       <input type="file" id="file" accept="video/*">
     </label>
     <div id="info"></div>
@@ -103,13 +106,13 @@ function estimate() {
 ['width','fps','start','end','maxFrames'].forEach(id => $(id).addEventListener('input', estimate));
 
 // ---------- load
-$('file').addEventListener('change', e => {
+['file', 'fileAny'].forEach(id => $(id).addEventListener('change', e => {
   fileObj = e.target.files[0]; if (!fileObj) return;
   if (objUrl) URL.revokeObjectURL(objUrl);
   objUrl = URL.createObjectURL(fileObj);
   $('go').disabled = true; $('out').innerHTML = '';
   v.src = objUrl;
-});
+}));
 v.addEventListener('loadedmetadata', () => {
   $('info').textContent = `${fileObj.name} · ${v.videoWidth}×${v.videoHeight} · ${v.duration.toFixed(2)}s · ${mb(fileObj.size)}`;
   $('go').disabled = false; estimate();
