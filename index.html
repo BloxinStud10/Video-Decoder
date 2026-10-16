@@ -50,11 +50,14 @@
       <label>MP3 bitrate (kbps)<input type="number" id="bitrate" value="128" min="32" max="320" step="32"></label>
       <label>Pixel tolerance (0 = lossless, 0–255)<input type="number" id="tol" value="2" min="0" max="255" step="1"></label>
       <label>Keyframe every (frames)<input type="number" id="keyEvery" value="40" min="1" max="1000"></label>
+      <label>Max part size (MB)<input type="number" id="partMB" value="20" min="1" max="500"></label>
     </div>
     <div class="row" style="margin-top:10px">
       <label class="chk"><input type="checkbox" id="audio" checked> Extract audio</label>
       <label class="chk"><input type="checkbox" id="mono"> Mono audio</label>
       <label class="chk"><input type="checkbox" id="lz4" checked> LZ4 compress frames</label>
+      <label class="chk"><input type="checkbox" id="rgb" checked> Drop alpha (RGB, -25%)</label>
+      <label class="chk"><input type="checkbox" id="zip" checked> Also make ZIP (slower)</label>
     </div>
     <div id="est" style="margin-top:8px;font-size:12px;color:var(--mut)"></div>
   </div>
@@ -81,6 +84,7 @@ const val = id => +$(id).value;
 const even = n => Math.max(2, Math.round(n / 2) * 2);
 const log = t => { $('log').textContent = t; };
 const mb = b => (b / 1048576).toFixed(1) + ' MB';
+const yieldUI = () => new Promise(r => { const c = new MessageChannel(); c.port1.onmessage = () => r(); c.port2.postMessage(0); });
 
 function dims() {
   const w = even(val('width')), h = even(w * v.videoHeight / v.videoWidth);
@@ -100,9 +104,9 @@ function frameTotal() {
 function estimate() {
   if (!v.videoWidth) return;
   const { w, h } = dims(), n = frameTotal();
-  $('est').textContent = `${w}×${h}, ${n} frames, worst case ~${mb(w * h * 4 * n)} (delta coding is usually far smaller)`;
+  $('est').textContent = `${w}×${h}, ${n} frames, worst case ~${mb(w * h * ($('rgb').checked ? 3 : 4) * n)} (delta coding is usually far smaller)`;
 }
-['width','fps','start','end','maxFrames'].forEach(id => $(id).addEventListener('input', estimate));
+['width','fps','start','end','maxFrames','rgb'].forEach(id => $(id).addEventListener('input', estimate));
 
 // ---------- load
 ['file', 'fileAny'].forEach(id => $(id).addEventListener('change', e => {
@@ -126,25 +130,32 @@ const seek = t => new Promise(res => {
 });
 
 /*
-  video.bin frame record (all u32 little-endian):
+  video part files (video.bin, or video_001.bin, video_002.bin... when split).
+  Parts are cut on frame boundaries and every part starts with a keyframe.
+  Frame record (all u32 little-endian):
     u32 opCount
-    opCount x { u32 skip, u32 lit, lit*4 bytes of RGBA }
+    opCount x { u32 skip, u32 lit, lit*bpp bytes }   bpp = 3 (RGB, alpha=255) or 4 (RGBA), see meta.rgb
   skip = pixels left unchanged since the previous frame, lit = pixels that follow.
-  A keyframe is one op: skip 0, lit = every pixel. An unchanged frame is just opCount = 0.
-  Each record is optionally LZ4 block-compressed on its own (kept raw if LZ4 doesn't make it smaller).
-  index.bin: per frame two u32: byte offset in video.bin, raw (uncompressed) record length.
-  One extra final entry holds the total size. Stored size = next offset - offset; if it equals
-  the raw length the record is stored raw, otherwise it is an LZ4 block.
+  Keyframe = one op: skip 0, lit = every pixel. Unchanged frame = opCount 0.
+  Each record is optionally LZ4 block-compressed (kept raw if LZ4 doesn't make it smaller).
+  index.bin: per frame three u32: [offset inside its part, stored length, raw length].
+  If stored length == raw length the record is raw, otherwise an LZ4 block.
+  meta.parts[i] = { name, firstFrame, bytes }; frame f lives in the last part with firstFrame <= f.
   The encoder compares against what the decoder will have (recon), so lossy tolerance never drifts.
 */
-function encodeFrame(px, recon, key, tol) {
+function encodeFrame(px, recon, key, tol, rgb) {
   const n = px.length >> 2;
   const ops = []; let totalLit = 0;
 
   if (key) {
     ops.push(0, n); totalLit = n;
   } else {
+    const p32 = new Uint32Array(px.buffer, px.byteOffset, n);
+    const r32 = new Uint32Array(recon.buffer, 0, n);
+    // fast path: identical 32-bit words are skipped without touching channels
     const changed = i => {
+      if (p32[i] === r32[i]) return false;
+      if (tol === 0) return true;
       const o = i * 4;
       return Math.abs(px[o] - recon[o]) > tol ||
              Math.abs(px[o + 1] - recon[o + 1]) > tol ||
@@ -164,7 +175,7 @@ function encodeFrame(px, recon, key, tol) {
     }
   }
 
-  const out = new Uint8Array(4 + ops.length * 4 + totalLit * 4);
+  const out = new Uint8Array(4 + ops.length * 4 + totalLit * (rgb ? 3 : 4));
   const dv = new DataView(out.buffer);
   dv.setUint32(0, ops.length >> 1, true);
   let pos = 4, p = 0;
@@ -173,9 +184,10 @@ function encodeFrame(px, recon, key, tol) {
     dv.setUint32(pos, skip, true); dv.setUint32(pos + 4, lit, true); pos += 8;
     p += skip;
     const a = p * 4, b = (p + lit) * 4;
-    out.set(px.subarray(a, b), pos);
+    if (rgb) { for (let q = a; q < b; q += 4) { out[pos++] = px[q]; out[pos++] = px[q + 1]; out[pos++] = px[q + 2]; } }
+    else { out.set(px.subarray(a, b), pos); pos += lit * 4; }
     recon.set(px.subarray(a, b), a);
-    pos += lit * 4; p += lit;
+    p += lit;
   }
   return out;
 }
@@ -218,30 +230,37 @@ function lz4Block(src) {
 async function extractFrames(onProgress) {
   const { w, h } = dims(), { start } = range(), fps = val('fps'), total = frameTotal();
   const keyEvery = Math.max(1, Math.floor(val('keyEvery'))), tol = Math.max(0, val('tol'));
+  const rgb = $('rgb').checked, useLz4 = $('lz4').checked;
+  const maxPart = Math.max(1, val('partMB')) * 1048576;
   const cv = new OffscreenCanvas(w, h);
   const ctx = cv.getContext('2d', { willReadFrequently: true });
   ctx.imageSmoothingQuality = 'high';
   const recon = new Uint8Array(w * h * 4);
-  const offsets = new Uint32Array((total + 1) * 2); // [offset, rawLen] per frame
-  const useLz4 = $('lz4').checked; let maxRaw = 0;
-  const blobs = []; let batch = [], off = 0, n = 0;
+  const offsets = new Uint32Array(total * 3); // [offset in part, stored len, raw len]
+  const parts = []; let blobs = [], batch = [], partBytes = 0, partFirst = 0, bytes = 0, maxRaw = 0, n = 0;
+  const flush = () => { if (batch.length) { blobs.push(new Blob(batch)); batch = []; } }; // spill to Blob, keeps heap small
+  const closePart = next => { flush(); parts.push({ blob: new Blob(blobs), bytes: partBytes, first: partFirst }); blobs = []; partBytes = 0; partFirst = next; };
+  const pack = rec => { if (useLz4) { const c = lz4Block(rec); if (c.length < rec.length) return c; } return rec; };
+  let lastYield = performance.now();
   for (; n < total; n++) {
     if (cancelled) throw new Error('cancelled');
     await seek(start + n / fps + 0.0005);
     ctx.drawImage(v, 0, 0, w, h);
     const px = ctx.getImageData(0, 0, w, h).data;
-    const rec = encodeFrame(px, recon, n % keyEvery === 0, tol);
-    let stored = rec;
-    if (useLz4) { const c = lz4Block(rec); if (c.length < rec.length) stored = c; }
+    const key = n % keyEvery === 0;
+    let rec = encodeFrame(px, recon, key, tol, rgb), stored = pack(rec);
+    if (partBytes > 0 && partBytes + stored.length > maxPart) {
+      closePart(n);
+      if (!key) { rec = encodeFrame(px, recon, true, tol, rgb); stored = pack(rec); } // every part starts on a keyframe
+    }
     if (rec.length > maxRaw) maxRaw = rec.length;
-    offsets[n * 2] = off; offsets[n * 2 + 1] = rec.length; off += stored.length;
-    batch.push(stored);
-    if (batch.length >= 256) { blobs.push(new Blob(batch)); batch = []; } // spill to Blob, keeps JS heap small
-    if (n % 4 === 0) { onProgress(n / total); await new Promise(r => setTimeout(r)); }
+    offsets[n * 3] = partBytes; offsets[n * 3 + 1] = stored.length; offsets[n * 3 + 2] = rec.length;
+    partBytes += stored.length; bytes += stored.length; batch.push(stored);
+    if (batch.length >= 256) flush();
+    if (performance.now() - lastYield > 100) { onProgress(n / total); await yieldUI(); lastYield = performance.now(); }
   }
-  offsets[total * 2] = off;
-  if (batch.length) blobs.push(new Blob(batch));
-  return { blob: new Blob(blobs), offsets, bytes: off, width: w, height: h, count: n, keyEvery, maxRaw, lz4: useLz4, raw: w * h * 4 * n };
+  if (partBytes > 0 || !parts.length) closePart(n);
+  return { parts, offsets, bytes, width: w, height: h, count: n, keyEvery, maxRaw, lz4: useLz4, rgb, raw: w * h * 4 * n };
 }
 
 // ---------- audio -> mp3
@@ -279,7 +298,7 @@ async function extractMp3() {
       ? enc.encodeBuffer(toI16(L, i, n, buf.numberOfChannels > 1 && $('mono').checked ? buf.getChannelData(1).subarray(a, b) : null))
       : enc.encodeBuffer(toI16(L, i, n), toI16(R, i, n));
     if (out.length) parts.push(new Uint8Array(out));
-    if ((i / BLOCK) % 10 === 0) await new Promise(r => setTimeout(r));
+    if ((i / BLOCK) % 10 === 0) await yieldUI();
   }
   const tail = enc.flush(); if (tail.length) parts.push(new Uint8Array(tail));
   return new Blob(parts, { type: 'audio/mpeg' });
@@ -348,23 +367,26 @@ $('go').addEventListener('click', async () => {
     let audio = null;
     if ($('audio').checked) { log('Encoding MP3…'); $('bar').removeAttribute('value'); audio = await extractMp3(); }
 
+    const one = fr.parts.length === 1;
+    const pname = i => one ? 'video.bin' : `video_${String(i + 1).padStart(3, '0')}.bin`;
     const meta = {
-      format: 'rgba8-delta2', width: fr.width, height: fr.height, lz4: fr.lz4, maxRaw: fr.maxRaw,
-      count: fr.count, fps: val('fps'), keyEvery: fr.keyEvery,
+      format: fr.rgb ? 'rgb8-delta3' : 'rgba8-delta3', rgb: fr.rgb, width: fr.width, height: fr.height,
+      lz4: fr.lz4, maxRaw: fr.maxRaw, count: fr.count, fps: val('fps'), keyEvery: fr.keyEvery,
       videoBytes: fr.bytes,
+      parts: fr.parts.map((p, i) => ({ name: pname(i), firstFrame: p.first, bytes: p.bytes })),
       hasAudio: !!audio, audioBytes: audio ? audio.size : 0, bitrate: Math.round(val('bitrate')),
     };
-    const files = [
-      { name: 'video.bin', blob: fr.blob },
-      { name: 'index.bin', blob: new Blob([fr.offsets.buffer]) },
-    ];
+    const files = fr.parts.map((p, i) => ({ name: pname(i), blob: p.blob }));
+    files.push({ name: 'index.bin', blob: new Blob([fr.offsets.buffer]) });
     if (audio) files.push({ name: 'audio.mp3', blob: audio });
     files.push({ name: 'meta.json', blob: new Blob([JSON.stringify(meta)], { type: 'application/json' }) });
-    log('Making ZIP…'); $('bar').removeAttribute('value');
-    addDl(await makeZip(files), 'video-data.zip');
+    if ($('zip').checked) {
+      log('Making ZIP…'); $('bar').removeAttribute('value');
+      addDl(await makeZip(files), 'video-data.zip');
+    }
     files.forEach(f => addDl(f.blob, f.name));
-    log(`Done in ${((performance.now() - t0) / 1000).toFixed(1)}s · ${fr.count} frames ${fr.width}×${fr.height}\n` +
-        `video.bin ${mb(fr.bytes)} vs ${mb(fr.raw)} raw (${(fr.raw / Math.max(1, fr.bytes)).toFixed(1)}x smaller)` +
+    log(`Done in ${((performance.now() - t0) / 1000).toFixed(1)}s · ${fr.count} frames ${fr.width}×${fr.height} · ${fr.parts.length} part(s)\n` +
+        `video ${mb(fr.bytes)} vs ${mb(fr.raw)} raw RGBA (${(fr.raw / Math.max(1, fr.bytes)).toFixed(1)}x smaller)` +
         (audio ? '' : $('audio').checked ? '\nNo audio track found' : ''));
   } catch (e) {
     log(e.message === 'cancelled' ? 'Cancelled.' : 'Error: ' + e.message);
