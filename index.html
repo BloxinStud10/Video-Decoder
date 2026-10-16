@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Video → RGBA frames + MP3</title>
+<title>Video → delta frames + MP3</title>
 <style>
   :root { --bg:#14161a; --card:#1d2026; --fg:#e8eaed; --mut:#9aa0a6; --acc:#4f8cff; --bd:#2c3038; }
   @media (prefers-color-scheme: light) { :root { --bg:#f4f5f7; --card:#fff; --fg:#1b1d21; --mut:#6b7280; --bd:#dcdfe4; } }
@@ -28,7 +28,7 @@
 </head>
 <body>
 <main>
-  <h1>Video → RGBA frames + MP3</h1>
+  <h1>Video → delta frames + MP3</h1>
 
   <div class="card">
     <label>Choose from Files / Downloads (mp4, webm, mov…)
@@ -48,14 +48,13 @@
       <label>End (s, 0 = full)<input type="number" id="end" value="0" min="0" step="0.1"></label>
       <label>Max frames (0 = no limit)<input type="number" id="maxFrames" value="0" min="0"></label>
       <label>MP3 bitrate (kbps)<input type="number" id="bitrate" value="128" min="32" max="320" step="32"></label>
+      <label>Pixel tolerance (0 = lossless, 0–255)<input type="number" id="tol" value="2" min="0" max="255" step="1"></label>
+      <label>Keyframe every (frames)<input type="number" id="keyEvery" value="40" min="1" max="1000"></label>
     </div>
     <div class="row" style="margin-top:10px">
       <label class="chk"><input type="checkbox" id="audio" checked> Extract audio</label>
       <label class="chk"><input type="checkbox" id="mono"> Mono audio</label>
-    </div>
-    <div class="row" style="margin-top:10px;align-items:end">
-      <label class="chk"><input type="checkbox" id="dedupe" checked> Skip duplicate frames</label>
-      <label style="width:150px">Tolerance (0 = exact, 0–255)<input type="number" id="tol" value="1" min="0" max="255" step="0.1"></label>
+      <label class="chk"><input type="checkbox" id="lz4" checked> LZ4 compress frames</label>
     </div>
     <div id="est" style="margin-top:8px;font-size:12px;color:var(--mut)"></div>
   </div>
@@ -84,7 +83,7 @@ const log = t => { $('log').textContent = t; };
 const mb = b => (b / 1048576).toFixed(1) + ' MB';
 
 function dims() {
-  const w = even(val('width')) , h = even(w * v.videoHeight / v.videoWidth);
+  const w = even(val('width')), h = even(w * v.videoHeight / v.videoWidth);
   return { w, h };
 }
 function range() {
@@ -101,7 +100,7 @@ function frameTotal() {
 function estimate() {
   if (!v.videoWidth) return;
   const { w, h } = dims(), n = frameTotal();
-  $('est').textContent = `${w}×${h}, ${n} frames, ~${mb(w * h * 4 * n)} raw RGBA`;
+  $('est').textContent = `${w}×${h}, ${n} frames, worst case ~${mb(w * h * 4 * n)} (delta coding is usually far smaller)`;
 }
 ['width','fps','start','end','maxFrames'].forEach(id => $(id).addEventListener('input', estimate));
 
@@ -126,44 +125,123 @@ const seek = t => new Promise(res => {
   v.currentTime = t;
 });
 
-// mean abs RGB difference <= tol (0 = exact match); aborts early once it can't pass
-function similar(a, b, tol) {
-  const limit = tol * (a.length / 4) * 3;
-  let sum = 0;
-  for (let i = 0; i < a.length; i += 4) {
-    sum += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
-    if (sum > limit) return false;
+/*
+  video.bin frame record (all u32 little-endian):
+    u32 opCount
+    opCount x { u32 skip, u32 lit, lit*4 bytes of RGBA }
+  skip = pixels left unchanged since the previous frame, lit = pixels that follow.
+  A keyframe is one op: skip 0, lit = every pixel. An unchanged frame is just opCount = 0.
+  Each record is optionally LZ4 block-compressed on its own (kept raw if LZ4 doesn't make it smaller).
+  index.bin: per frame two u32: byte offset in video.bin, raw (uncompressed) record length.
+  One extra final entry holds the total size. Stored size = next offset - offset; if it equals
+  the raw length the record is stored raw, otherwise it is an LZ4 block.
+  The encoder compares against what the decoder will have (recon), so lossy tolerance never drifts.
+*/
+function encodeFrame(px, recon, key, tol) {
+  const n = px.length >> 2;
+  const ops = []; let totalLit = 0;
+
+  if (key) {
+    ops.push(0, n); totalLit = n;
+  } else {
+    const changed = i => {
+      const o = i * 4;
+      return Math.abs(px[o] - recon[o]) > tol ||
+             Math.abs(px[o + 1] - recon[o + 1]) > tol ||
+             Math.abs(px[o + 2] - recon[o + 2]) > tol;
+    };
+    let i = 0, last = 0;
+    while (i < n) {
+      while (i < n && !changed(i)) i++;
+      if (i >= n) break;
+      const startPx = i; let end = i + 1, gap = 0;
+      for (let j = i + 1; j < n; j++) {
+        if (changed(j)) { end = j + 1; gap = 0; }
+        else if (++gap > 2) break; // gaps of <=2 pixels are cheaper to just include
+      }
+      ops.push(startPx - last, end - startPx);
+      totalLit += end - startPx; last = end; i = end;
+    }
   }
-  return true;
+
+  const out = new Uint8Array(4 + ops.length * 4 + totalLit * 4);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, ops.length >> 1, true);
+  let pos = 4, p = 0;
+  for (let k = 0; k < ops.length; k += 2) {
+    const skip = ops[k], lit = ops[k + 1];
+    dv.setUint32(pos, skip, true); dv.setUint32(pos + 4, lit, true); pos += 8;
+    p += skip;
+    const a = p * 4, b = (p + lit) * 4;
+    out.set(px.subarray(a, b), pos);
+    recon.set(px.subarray(a, b), a);
+    pos += lit * 4; p += lit;
+  }
+  return out;
+}
+
+// Standard LZ4 block compressor (no frame header), compatible with llz4 / lz4decompress.
+const lzTable = new Int32Array(1 << 16);
+function lz4Block(src) {
+  const n = src.length;
+  const dst = new Uint8Array(n + ((n / 255) | 0) + 16);
+  let d = 0, anchor = 0, i = 0;
+  const writeLen = v => { while (v >= 255) { dst[d++] = 255; v -= 255; } dst[d++] = v; };
+  if (n >= 13) {
+    lzTable.fill(-1);
+    const matchEnd = n - 5, last = n - 12;
+    while (i <= last) {
+      const seq = (src[i] | (src[i + 1] << 8) | (src[i + 2] << 16) | (src[i + 3] << 24)) >>> 0;
+      const h = Math.imul(seq, 2654435761) >>> 16;
+      const ref = lzTable[h]; lzTable[h] = i;
+      if (ref >= 0 && i - ref <= 65535 &&
+          src[ref] === src[i] && src[ref + 1] === src[i + 1] && src[ref + 2] === src[i + 2] && src[ref + 3] === src[i + 3]) {
+        let m = 4;
+        while (i + m < matchEnd && src[ref + m] === src[i + m]) m++;
+        const lit = i - anchor, ml = m - 4, off = i - ref;
+        dst[d++] = (Math.min(lit, 15) << 4) | Math.min(ml, 15);
+        if (lit >= 15) writeLen(lit - 15);
+        dst.set(src.subarray(anchor, i), d); d += lit;
+        dst[d++] = off & 255; dst[d++] = off >> 8;
+        if (ml >= 15) writeLen(ml - 15);
+        i += m; anchor = i;
+      } else i++;
+    }
+  }
+  const lit = n - anchor;
+  dst[d++] = Math.min(lit, 15) << 4;
+  if (lit >= 15) writeLen(lit - 15);
+  dst.set(src.subarray(anchor, n), d); d += lit;
+  return dst.subarray(0, d);
 }
 
 async function extractFrames(onProgress) {
   const { w, h } = dims(), { start } = range(), fps = val('fps'), total = frameTotal();
+  const keyEvery = Math.max(1, Math.floor(val('keyEvery'))), tol = Math.max(0, val('tol'));
   const cv = new OffscreenCanvas(w, h);
   const ctx = cv.getContext('2d', { willReadFrequently: true });
   ctx.imageSmoothingQuality = 'high';
-  const frameBytes = w * h * 4;
-  const dedupe = $('dedupe').checked, tol = Math.max(0, val('tol'));
-  const map = new Uint32Array(total); // timeline frame -> unique frame index
-  const blobs = []; let batch = [];
-  let n = 0, unique = 0, prev = null;
+  const recon = new Uint8Array(w * h * 4);
+  const offsets = new Uint32Array((total + 1) * 2); // [offset, rawLen] per frame
+  const useLz4 = $('lz4').checked; let maxRaw = 0;
+  const blobs = []; let batch = [], off = 0, n = 0;
   for (; n < total; n++) {
     if (cancelled) throw new Error('cancelled');
     await seek(start + n / fps + 0.0005);
     ctx.drawImage(v, 0, 0, w, h);
-    const px = ctx.getImageData(0, 0, w, h).data; // Uint8ClampedArray, RGBA
-    if (dedupe && prev && similar(prev, px, tol)) {
-      map[n] = unique - 1; // reuse the last kept frame
-    } else {
-      map[n] = unique++;
-      prev = px;
-      batch.push(px);
-      if (batch.length >= 64) { blobs.push(new Blob(batch)); batch = []; } // lets the browser move data off the JS heap
-    }
+    const px = ctx.getImageData(0, 0, w, h).data;
+    const rec = encodeFrame(px, recon, n % keyEvery === 0, tol);
+    let stored = rec;
+    if (useLz4) { const c = lz4Block(rec); if (c.length < rec.length) stored = c; }
+    if (rec.length > maxRaw) maxRaw = rec.length;
+    offsets[n * 2] = off; offsets[n * 2 + 1] = rec.length; off += stored.length;
+    batch.push(stored);
+    if (batch.length >= 256) { blobs.push(new Blob(batch)); batch = []; } // spill to Blob, keeps JS heap small
     if (n % 4 === 0) { onProgress(n / total); await new Promise(r => setTimeout(r)); }
   }
+  offsets[total * 2] = off;
   if (batch.length) blobs.push(new Blob(batch));
-  return { blob: new Blob(blobs), width: w, height: h, count: n, unique, map, frameBytes };
+  return { blob: new Blob(blobs), offsets, bytes: off, width: w, height: h, count: n, keyEvery, maxRaw, lz4: useLz4, raw: w * h * 4 * n };
 }
 
 // ---------- audio -> mp3
@@ -171,9 +249,9 @@ async function extractMp3() {
   const ac = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
   let buf;
   try { buf = await ac.decodeAudioData(await fileObj.arrayBuffer()); }
-  catch { await ac.close(); return null; } // no audio track / undecodable
+  catch { await ac.close(); return null; }
   await ac.close();
-  const sr = buf.sampleRate; // some browsers ignore the requested rate; using the real one keeps speed/length correct
+  const sr = buf.sampleRate;
   const { start } = range(), fps = val('fps');
   const frames = frameTotal();
   const endT = Math.min(range().end, start + frames / fps);
@@ -271,23 +349,23 @@ $('go').addEventListener('click', async () => {
     if ($('audio').checked) { log('Encoding MP3…'); $('bar').removeAttribute('value'); audio = await extractMp3(); }
 
     const meta = {
-      format: 'rgba8', width: fr.width, height: fr.height,
-      count: fr.count,            // timeline frames (duration = count / fps)
-      uniqueCount: fr.unique,     // frames actually stored in frames.rgba
-      hasMap: fr.unique < fr.count, // true -> map.bin (u32 LE per timeline frame -> 0-based unique index)
-      frameBytes: fr.frameBytes, fps: val('fps'),
+      format: 'rgba8-delta2', width: fr.width, height: fr.height, lz4: fr.lz4, maxRaw: fr.maxRaw,
+      count: fr.count, fps: val('fps'), keyEvery: fr.keyEvery,
+      videoBytes: fr.bytes,
       hasAudio: !!audio, audioBytes: audio ? audio.size : 0, bitrate: Math.round(val('bitrate')),
     };
-    const files = [{ name: 'frames.rgba', blob: fr.blob }];
+    const files = [
+      { name: 'video.bin', blob: fr.blob },
+      { name: 'index.bin', blob: new Blob([fr.offsets.buffer]) },
+    ];
     if (audio) files.push({ name: 'audio.mp3', blob: audio });
-    if (meta.hasMap) files.push({ name: 'map.bin', blob: new Blob([fr.map.buffer]) }); // u32 little-endian
     files.push({ name: 'meta.json', blob: new Blob([JSON.stringify(meta)], { type: 'application/json' }) });
     log('Making ZIP…'); $('bar').removeAttribute('value');
     addDl(await makeZip(files), 'video-data.zip');
     files.forEach(f => addDl(f.blob, f.name));
-    log(`Done in ${((performance.now() - t0) / 1000).toFixed(1)}s · ${fr.count} timeline frames, ${fr.unique} stored (${fr.width}×${fr.height})` +
-        (audio ? '' : $('audio').checked ? ' · no audio track found' : '') +
-        (meta.hasMap ? '\nDuplicates were skipped: map.bin is inside the ZIP. If you save files one by one, save map.bin too.' : ''));
+    log(`Done in ${((performance.now() - t0) / 1000).toFixed(1)}s · ${fr.count} frames ${fr.width}×${fr.height}\n` +
+        `video.bin ${mb(fr.bytes)} vs ${mb(fr.raw)} raw (${(fr.raw / Math.max(1, fr.bytes)).toFixed(1)}x smaller)` +
+        (audio ? '' : $('audio').checked ? '\nNo audio track found' : ''));
   } catch (e) {
     log(e.message === 'cancelled' ? 'Cancelled.' : 'Error: ' + e.message);
   } finally {
