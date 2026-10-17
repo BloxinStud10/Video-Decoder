@@ -71,6 +71,14 @@
     <div id="est" style="margin-top:8px;font-size:12px;color:var(--mut)"></div>
   </div>
 
+  <div class="card">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <button id="pvGo" class="sec" disabled>▶ Preview</button>
+      <label class="chk"><input type="checkbox" id="pvSnd"> Sound</label>
+    </div>
+    <canvas id="pv" style="width:100%;margin-top:8px;border-radius:6px;background:#000;image-rendering:pixelated"></canvas>
+  </div>
+
   <div class="row">
     <button id="go" disabled>Convert</button>
     <button id="stop" class="sec" disabled>Cancel</button>
@@ -127,12 +135,13 @@ function estimate() {
   fileObj = e.target.files[0]; if (!fileObj) return;
   if (objUrl) URL.revokeObjectURL(objUrl);
   objUrl = URL.createObjectURL(fileObj);
+  if (typeof pvStop === 'function') pvStop();
   $('go').disabled = true; $('out').innerHTML = '';
   v.src = objUrl;
 }));
 v.addEventListener('loadedmetadata', () => {
   $('info').textContent = `${fileObj.name} · ${v.videoWidth}×${v.videoHeight} · ${v.duration.toFixed(2)}s · ${mb(fileObj.size)}`;
-  $('go').disabled = false; estimate();
+  $('go').disabled = false; $('pvGo').disabled = false; estimate();
 });
 v.addEventListener('error', () => log('Browser cannot decode this video.'));
 
@@ -760,6 +769,45 @@ async function makeZip(files) {
   return new Blob([...parts, ...central, end.buffer], { type: 'application/zip' });
 }
 
+// ---------- live preview (simulates width, fps, RGB565, tolerance, keyframes)
+let pvRun = false;
+function pvStop() { pvRun = false; v.pause(); v.muted = true; $('pvGo').textContent = '▶ Preview'; }
+$('pvGo').addEventListener('click', async () => {
+  if (pvRun) return pvStop();
+  const { w, h } = dims(), { start, end } = range(), fps = val('fps'), tol = val('tol');
+  const keyEvery = Math.max(1, Math.floor(val('keyEvery'))), fmt = pixFmt(), maxF = Math.floor(val('maxFrames'));
+  const cv = $('pv'); cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  const recon = new Uint8ClampedArray(w * h * 4), img = new ImageData(recon, w, h);
+  let last = -1;
+  pvRun = true; $('pvGo').textContent = '■ Stop';
+  v.muted = !$('pvSnd').checked;
+  await seek(start);
+  try { await v.play(); } catch { v.muted = true; await v.play().catch(() => {}); }
+  const tick = () => {
+    if (!pvRun) return;
+    const t = v.currentTime, n = Math.floor((t - start) * fps);
+    if (v.ended || t >= end || (maxF > 0 && n >= maxF)) return pvStop();
+    if (n !== last) {
+      last = n;
+      ctx.drawImage(v, 0, 0, w, h);
+      const px = ctx.getImageData(0, 0, w, h).data, key = n % keyEvery === 0;
+      for (let i = 0; i < px.length; i += 4) {
+        let r = px[i], g = px[i + 1], b = px[i + 2];
+        if (fmt === 2) { r >>= 3; r = (r << 3) | (r >> 2); g >>= 2; g = (g << 2) | (g >> 4); b >>= 3; b = (b << 3) | (b >> 2); }
+        if (key || Math.abs(r - recon[i]) > tol || Math.abs(g - recon[i + 1]) > tol || Math.abs(b - recon[i + 2]) > tol) {
+          recon[i] = r; recon[i + 1] = g; recon[i + 2] = b;
+        }
+        recon[i + 3] = 255;
+      }
+      ctx.putImageData(img, 0, 0);
+    }
+    requestAnimationFrame(tick);
+  };
+  tick();
+});
+
 // ---------- run
 function addDl(blob, name) {
   const a = document.createElement('a');
@@ -769,6 +817,7 @@ function addDl(blob, name) {
 }
 
 $('go').addEventListener('click', async () => {
+  pvStop();
   cancelled = false; $('out').innerHTML = '';
   $('go').disabled = true; $('stop').disabled = false; $('bar').hidden = false; $('bar').value = 0;
   try {
