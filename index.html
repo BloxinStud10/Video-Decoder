@@ -28,7 +28,7 @@
 </head>
 <body>
 <main>
-  <h1>Video → delta frames + MP3</h1>
+  <h1>Video → RGBA Frames + MP3</h1>
 
   <div class="card">
     <label>Choose from Files / Downloads (mp4, webm, mov…)
@@ -58,6 +58,8 @@
       <label class="chk"><input type="checkbox" id="lz4" checked> LZ4 compress frames</label>
       <label class="chk"><input type="checkbox" id="rgb" checked> Drop alpha (RGB, -25%)</label>
       <label class="chk"><input type="checkbox" id="zip" checked> Also make ZIP (slower)</label>
+      <label class="chk"><input type="checkbox" id="wasm" checked> WASM encode (faster)</label>
+      <label class="chk"><input type="checkbox" id="gpu"> GPU scale + readback (experimental)</label>
     </div>
     <div id="est" style="margin-top:8px;font-size:12px;color:var(--mut)"></div>
   </div>
@@ -338,6 +340,61 @@ onmessage = e => {
   postMessage({ n: m.n, stored: out, rawLen: rec.length, newPart, offset }, [out.buffer]);
 };`;
 
+// ---------- WASM encoder (delta + LZ4, hand-built module, same output bytes as the JS versions)
+const WASM_B64 = "AGFzbQEAAAABLAVgBH9/f38Bf2AGf39/f39/AX9gB39/f39/f38Bf2ACf38Bf2AEf39/fwF/AwYFAAECAwQFAwEAAQcVAwNtZW0CAAVkZWx0YQACA2x6NAAECugJBY0CAQN/IAJBBGwhBCAAIARqKAIAIQUgASAEaigCACEGIAUgBkYEQEEADwsgA0EARgRAQQEPCyAAIARqLQAAIAEgBGotAABrIAEgBGotAAAgACAEai0AAGsgACAEai0AACABIARqLQAASxsgA0sEf0EBBSAAIARqQQFqLQAAIAEgBGpBAWotAABrIAEgBGpBAWotAAAgACAEakEBai0AAGsgACAEakEBai0AACABIARqQQFqLQAASxsgA0sLBH9BAQUgACAEakECai0AACABIARqQQJqLQAAayABIARqQQJqLQAAIAAgBGpBAmotAABrIAAgBGpBAmotAAAgASAEakECai0AAEsbIANLCw9BAAuMAQECfyAAIANBBGxqIQYgBiAEQQRsaiEHAkADQCAGIAdJRQ0BIAUEQCACIAYtAAA6AAAgAkEBaiAGQQFqLQAAOgAAIAJBAmogBkECai0AADoAACACQQNqIQIFIAIgBigCADYCACACQQRqIQILIAEgBiAAa2ogBigCADYCACAGQQRqIQYMAAsLIAIPQQALsQIBCH8gBkEEaiEHQQAhDiADBEAgB0EANgIAIAdBBGogAjYCACAHQQhqIQcgACABIAdBACACIAUQASEHQQEhDgVBACEIQQAhCQJAA0AgCCACSUUNAQJAA0AgCCACSQR/IAAgASAIIAQQAEUFQQALRQ0BIAhBAWohCAwACwsgCCACTwRADAILIAghCiAIQQFqIQtBACEMIAhBAWohDQJAA0AgDSACSUUNASAAIAEgDSAEEAAEQCANQQFqIQtBACEMBSAMQQFqIQwgDEECSwRADAMLCyANQQFqIQ0MAAsLIAcgCiAJazYCACAHQQRqIAsgCms2AgAgB0EIaiEHIAAgASAHIAogCyAKayAFEAEhByAOQQFqIQ4gCyEJIAshCAwACwsLIAYgDjYCACAHIAZrD0EACzkAAkADQCABQf8BT0UNASAAQf8BOgAAIABBAWohACABQf8BayEBDAALCyAAIAE6AAAgAEEBag9BAAvbAwEMfyACIQRBACEFQQAhBiABQQ1PBEAgA0EAQYCAEPwLACABQQVrIQcgAUEMayEIAkADQCAGIAhNRQ0BIAAgBmooAgAhCSAJQbHz3fF5bEEQdiEKIAMgCkEEbGooAgAhCyADIApBBGxqIAZBAWo2AgAgC0EARwR/IAZBAWogC2tB//8DTQVBAAsEfyAAIAtqQQFrKAIAIAlGBUEACwRAIAtBAWshC0EEIQwCQANAIAYgDGogB0kEfyAAIAtqIAxqLQAAIAAgBmogDGotAABGBUEAC0UNASAMQQFqIQwMAAsLIAYgBWshDSAMQQRrIQ4gBiALayEPIAQgDUEPIA1BD0kbQQR0IA5BDyAOQQ9JG3I6AAAgBEEBaiEEIA1BD08EQCAEIA1BD2sQAyEECyAEIAAgBWogDfwKAAAgBCANaiEEIAQgD0H/AXE6AAAgBEEBaiAPQQh2OgAAIARBAmohBCAOQQ9PBEAgBCAOQQ9rEAMhBAsgBiAMaiEGIAYhBQUgBkEBaiEGCwwACwsLIAEgBWshDSAEIA1BDyANQQ9JG0EEdDoAACAEQQFqIQQgDUEPTwRAIAQgDUEPaxADIQQLIAQgACAFaiAN/AoAACAEIA1qIQQgBCACaw9BAAs=";
+function wasmEnc(bytes, nPix) {
+  const ex = new WebAssembly.Instance(new WebAssembly.Module(bytes), {}).exports;
+  const HT = 0, PX = 262144, RC = PX + nPix * 4, REC = RC + nPix * 4;
+  const recMax = nPix * 7 + 64, LZ = REC + ((recMax + 3) & ~3), END = LZ + recMax + ((recMax / 255) | 0) + 64;
+  ex.mem.grow(Math.ceil(END / 65536));
+  const u8 = new Uint8Array(ex.mem.buffer);
+  return (px, key, tol, rgb, useLz4) => {
+    u8.set(new Uint8Array(px.buffer, px.byteOffset, px.length), PX);
+    const len = ex.delta(PX, RC, nPix, key ? 1 : 0, tol, rgb ? 1 : 0, REC);
+    if (useLz4) { const c = ex.lz4(REC, len, LZ, HT); if (c < len) return { st: u8.slice(LZ, LZ + c), raw: len }; }
+    return { st: u8.slice(REC, REC + len), raw: len };
+  };
+}
+
+// ---------- GPU scaler (WebGL2 mipmapped downscale, rotation in the shader). Returns null if unavailable.
+function makeGpu(w, h, rot) {
+  const cv = new OffscreenCanvas(w, h);
+  const gl = cv.getContext('webgl2', { antialias: false, alpha: false, premultipliedAlpha: false, preserveDrawingBuffer: true });
+  if (!gl) return null;
+  const NL = String.fromCharCode(10);
+  const mk = (type, lines) => {
+    const o = gl.createShader(type); gl.shaderSource(o, lines.join(NL)); gl.compileShader(o);
+    if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error('shader: ' + gl.getShaderInfoLog(o));
+    return o;
+  };
+  const pr = gl.createProgram();
+  gl.attachShader(pr, mk(gl.VERTEX_SHADER, ['#version 300 es', 'in vec2 p;', 'void main(){ gl_Position = vec4(p, 0.0, 1.0); }']));
+  gl.attachShader(pr, mk(gl.FRAGMENT_SHADER, ['#version 300 es', 'precision highp float;', 'uniform sampler2D t; uniform vec2 sz; uniform int r; out vec4 o;',
+    'void main(){ vec2 c = gl_FragCoord.xy / sz - 0.5;',
+    '  vec2 s = r == 0 ? c : (r == 1 ? vec2(c.y, -c.x) : (r == 2 ? -c : vec2(-c.y, c.x)));',
+    '  o = vec4(texture(t, s + 0.5).rgb, 1.0); }']));
+  gl.linkProgram(pr);
+  if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) throw new Error('link failed');
+  gl.useProgram(pr);
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(pr, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  gl.uniform2f(gl.getUniformLocation(pr, 'sz'), w, h);
+  gl.uniform1i(gl.getUniformLocation(pr, 'r'), (rot / 90) | 0);
+  gl.viewport(0, 0, w, h);
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  const buf = new Uint8Array(w * h * 4);
+  return frame => {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    return buf;
+  };
+}
+
 // ---------- parallel path: each worker decodes + scales + encodes its own range of frames
 const pworkerSrc = `
 const lzTable = new Int32Array(1 << 16);
@@ -345,9 +402,14 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 ${encodeFrame}
 ${lz4Block}
 ${drawRotated}
+${wasmEnc}
+${makeGpu}
 onmessage = e => run(e.data).catch(err => postMessage({ error: String((err && err.message) || err) }));
 async function run(m) {
   const { samples, ts, cfg, w, h, rot, fps, start, f0, f1, keyEvery, tol, rgb, lz4 } = m;
+  let enc = null, gpu = null;
+  if (m.useWasm) { try { enc = wasmEnc(m.wasm, w * h); } catch (e) { enc = null; } }
+  if (m.useGpu) { try { gpu = makeGpu(w, h, rot); } catch (e) { gpu = null; } }
   const ctx = new OffscreenCanvas(w, h).getContext('2d', { willReadFrequently: true });
   ctx.imageSmoothingQuality = 'high';
   const recon = new Uint8Array(w * h * 4);
@@ -382,14 +444,29 @@ async function run(m) {
     const target = (start + n / fps) * 1e6;
     while (nxt && nxt.timestamp <= target) { cur.close(); cur = nxt; nxt = await next(); }
     let t = performance.now();
-    drawRotated(ctx, cur, w, h, rot);
-    const px = ctx.getImageData(0, 0, w, h).data;
+    let px;
+    if (gpu) {
+      const g = gpu(cur);
+      if (n === f0) { // one-time sanity check against the canvas path; fall back if the GPU image looks wrong
+        drawRotated(ctx, cur, w, h, rot);
+        const p2 = ctx.getImageData(0, 0, w, h).data; let d = 0, cnt = 0;
+        for (let i = 0; i < p2.length; i += 64) { d += Math.abs(p2[i] - g[i]) + Math.abs(p2[i + 1] - g[i + 1]) + Math.abs(p2[i + 2] - g[i + 2]); cnt += 3; }
+        if (d / cnt > 24) { gpu = null; px = p2; } else px = g;
+      } else px = g;
+    } else {
+      drawRotated(ctx, cur, w, h, rot);
+      px = ctx.getImageData(0, 0, w, h).data;
+    }
     T.draw += performance.now() - t; t = performance.now();
-    const rec = encodeFrame(px, recon, n % keyEvery === 0, tol, rgb);
-    let st = rec;
-    if (lz4) { const c = lz4Block(rec); if (c.length < rec.length) st = c.slice(); }
+    let st, rawLen;
+    if (enc) { const r = enc(px, n % keyEvery === 0, tol, rgb, lz4); st = r.st; rawLen = r.raw; }
+    else {
+      const rec = encodeFrame(px, recon, n % keyEvery === 0, tol, rgb);
+      st = rec; rawLen = rec.length;
+      if (lz4) { const c = lz4Block(rec); if (c.length < rec.length) st = c.slice(); }
+    }
     T.enc += performance.now() - t;
-    frames.push(st); raws.push(rec.length);
+    frames.push(st); raws.push(rawLen);
     if (frames.length === keyEvery || n === f1 - 1) {
       postMessage({ block: first / keyEvery, frames, raws }, frames.map(f => f.buffer));
       frames = []; raws = []; first = n + 1;
@@ -398,7 +475,7 @@ async function run(m) {
   stop = true; cur.close(); if (nxt) nxt.close();
   q.forEach(f => f.close());
   if (dec.state !== 'closed') dec.close();
-  postMessage({ done: true, T });
+  postMessage({ done: true, T, wasm: !!enc, gpu: !!gpu });
 }`;
 
 async function extractFramesParallel(onProgress) {
@@ -446,7 +523,8 @@ async function extractFramesParallel(onProgress) {
   };
 
   const url = URL.createObjectURL(new Blob([pworkerSrc], { type: 'text/javascript' }));
-  const workers = [], T = { dec: 0, draw: 0, enc: 0 };
+  const workers = [], T = { dec: 0, draw: 0, enc: 0 }; let usedWasm = false, usedGpu = false;
+  const wasmBytes = Uint8Array.from(atob(WASM_B64), c => c.charCodeAt(0));
   try {
     await new Promise((resolve, reject) => {
       const poll = setInterval(() => { if (cancelled) { clearInterval(poll); reject(new Error('cancelled')); } }, 100);
@@ -463,20 +541,20 @@ async function extractFramesParallel(onProgress) {
           const r = e.data;
           if (r.error) return fail(new Error(r.error));
           if (r.done) {
-            T.dec += r.T.dec / 1000; T.draw += r.T.draw / 1000; T.enc += r.T.enc / 1000;
+            usedWasm = r.wasm; usedGpu = r.gpu; T.dec += r.T.dec / 1000; T.draw += r.T.draw / 1000; T.enc += r.T.enc / 1000;
             if (++finished === workers.length) { clearInterval(poll); resolve(); }
             return;
           }
           pending.set(r.block, { blob: new Blob(r.frames), lens: r.frames.map(f => f.byteLength), raws: r.raws });
           doneFrames += r.raws.length; assemble(); onProgress(doneFrames / total);
         };
-        wk.postMessage({ samples: out, ts, cfg, w, h, rot, fps, start, f0, f1, keyEvery, tol, rgb, lz4: useLz4 }, tr);
+        wk.postMessage({ samples: out, ts, cfg, w, h, rot, fps, start, f0, f1, keyEvery, tol, rgb, lz4: useLz4, wasm: wasmBytes, useWasm: $('wasm').checked, useGpu: $('gpu').checked }, tr);
       }
     });
   } finally { workers.forEach(x => x.terminate()); URL.revokeObjectURL(url); }
   if (nextBlock !== nBlocks) throw new Error('missing blocks');
   if (partBytes > 0 || !parts.length) closePart(total);
-  return { parts, offsets, bytes, width: w, height: h, count: total, keyEvery, maxRaw, lz4: useLz4, rgb, raw: w * h * 4 * total, wc: true, timing: { ...T, workers: workers.length } };
+  return { parts, offsets, bytes, width: w, height: h, count: total, keyEvery, maxRaw, lz4: useLz4, rgb, raw: w * h * 4 * total, wc: true, timing: { ...T, workers: workers.length, wasm: usedWasm, gpu: usedGpu } };
 }
 
 async function extractFrames(onProgress) {
@@ -695,7 +773,7 @@ $('go').addEventListener('click', async () => {
     }
     files.forEach(f => addDl(f.blob, f.name));
     log(`Done in ${((performance.now() - t0) / 1000).toFixed(1)}s (frames: ${tFrames.toFixed(1)}s, ${(fr.count / tFrames).toFixed(1)} fps) · ${fr.count} / ${total} frames ${fr.width}×${fr.height} · ${fr.parts.length} part(s) · ${fr.wc ? 'WebCodecs' : 'seek'} decode\n` +
-        (fr.timing ? `cpu-s over ${fr.timing.workers} workers: decode-wait ${fr.timing.dec.toFixed(1)} · draw ${fr.timing.draw.toFixed(1)} · encode ${fr.timing.enc.toFixed(1)}\n` : '') +
+        (fr.timing ? `cpu-s over ${fr.timing.workers} workers (${fr.timing.wasm ? 'wasm' : 'js'} encode, ${fr.timing.gpu ? 'gpu' : 'canvas'} scale): decode-wait ${fr.timing.dec.toFixed(1)} · draw ${fr.timing.draw.toFixed(1)} · encode ${fr.timing.enc.toFixed(1)}\n` : '') +
         `video ${mb(fr.bytes)} vs ${mb(fr.raw)} raw RGBA (${(fr.raw / Math.max(1, fr.bytes)).toFixed(1)}x smaller)` +
         (audio ? '' : $('audio').checked ? '\nNo audio track found' : ''));
   } catch (e) {
