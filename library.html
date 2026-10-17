@@ -41,7 +41,7 @@
 <main>
   <header>
     <h1>Library</h1>
-    <a class="nav" href="./?converter">← Converter</a>
+    <a class="nav" href="./">← Converter</a>
   </header>
 
   <details class="card" id="cfg">
@@ -203,8 +203,22 @@ function save(blob, name) {
   setTimeout(() => URL.revokeObjectURL(a.href), 60000);
 }
 
+// iPhone / iPad (iPadOS reports itself as a Mac, so also check for touch)
+const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
 async function download(x, btn) {
-  const old = btn.textContent; btn.disabled = true; btn.textContent = '0%';
+  const old = btn.textContent;
+  // iOS: Safari blocks programmatic blob downloads made after a long fetch and struggles with big blobs in memory.
+  // A plain link tap lets Safari's own download manager handle it (progress, Files app, any size).
+  if (isIOS && x.download_url && (x.release || !cfg.token)) {
+    const a = document.createElement('a');
+    a.href = x.download_url; a.download = x.name; a.rel = 'noopener';
+    document.body.appendChild(a); a.click(); a.remove();
+    btn.textContent = 'Started';
+    setTimeout(() => { btn.textContent = old; }, 2000);
+    return;
+  }
+  btn.disabled = true; btn.textContent = '0%';
   try {
     // private repos: the API URL with the raw media type works with a token; public: download_url
     // release assets: browser_download_url has no CORS, so use the API asset URL (it redirects to a CORS-enabled signed URL)
@@ -218,7 +232,20 @@ async function download(x, btn) {
       chunks.push(value); got += value.length;
       if (total) btn.textContent = Math.min(99, Math.round(got / total * 100)) + '%';
     }
-    save(new Blob(chunks, { type: 'application/zip' }), x.name);
+    const blob = new Blob(chunks, { type: 'application/zip' });
+    if (isIOS) {
+      // download finished; sharing needs a fresh tap, so turn the button into "Save…" (opens the share sheet → Save to Files)
+      btn.textContent = 'Save…'; btn.disabled = false;
+      btn.onclick = async () => {
+        try {
+          const file = new File([blob], x.name, { type: 'application/zip' });
+          if (navigator.canShare && navigator.canShare({ files: [file] })) await navigator.share({ files: [file] });
+          else save(blob, x.name);
+        } catch (e) { if (e.name !== 'AbortError') save(blob, x.name); }
+      };
+      return;
+    }
+    save(blob, x.name);
     btn.textContent = 'Done';
     setTimeout(() => { btn.textContent = old; btn.disabled = false; }, 1500);
   } catch (e) {
