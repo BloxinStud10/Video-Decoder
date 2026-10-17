@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Video → RGBA Frames + MP3</title>
+<title>Video → Frames + MP3</title>
 <style>
   :root { --bg:#14161a; --card:#1d2026; --fg:#e8eaed; --mut:#9aa0a6; --acc:#4f8cff; --bd:#2c3038; }
   @media (prefers-color-scheme: light) { :root { --bg:#f4f5f7; --card:#fff; --fg:#1b1d21; --mut:#6b7280; --bd:#dcdfe4; } }
@@ -28,7 +28,7 @@
 </head>
 <body>
 <main>
-  <h1>Video → RGBA Frames + MP3</h1>
+  <h1>Video → Frames + MP3</h1>
 
   <div class="card">
     <label>Choose from Files / Downloads (mp4, webm, mov…)
@@ -57,6 +57,7 @@
       <label class="chk"><input type="checkbox" id="mono"> Mono audio</label>
       <label class="chk"><input type="checkbox" id="lz4" checked> LZ4 compress frames</label>
       <label class="chk"><input type="checkbox" id="rgb" checked> Drop alpha (RGB, -25%)</label>
+      <label class="chk"><input type="checkbox" id="f565"> RGB565 (2 bytes/px, overrides RGB)</label>
       <label class="chk"><input type="checkbox" id="zip" checked> Also make ZIP (slower)</label>
       <label class="chk"><input type="checkbox" id="wasm" checked> WASM encode (faster)</label>
       <label class="chk"><input type="checkbox" id="gpu"> GPU scale + readback (experimental)</label>
@@ -105,12 +106,15 @@ function frameTotal() {
   const m = Math.floor(val('maxFrames')); if (m > 0) n = Math.min(n, m);
   return Math.max(0, n);
 }
+// 0 = RGBA, 1 = RGB, 2 = RGB565
+const pixFmt = () => $('f565').checked ? 2 : $('rgb').checked ? 1 : 0;
+const pixFmtBpp = () => [4, 3, 2][pixFmt()];
 function estimate() {
   if (!v.videoWidth) return;
   const { w, h } = dims(), n = frameTotal();
-  $('est').textContent = `${w}×${h}, ${n} frames, worst case ~${mb(w * h * ($('rgb').checked ? 3 : 4) * n)} (delta coding is usually far smaller)`;
+  $('est').textContent = `${w}×${h}, ${n} frames, worst case ~${mb(w * h * pixFmtBpp() * n)} (delta coding is usually far smaller)`;
 }
-['width','fps','start','end','maxFrames','rgb'].forEach(id => $(id).addEventListener('input', estimate));
+['width','fps','start','end','maxFrames','rgb','f565'].forEach(id => $(id).addEventListener('input', estimate));
 
 // ---------- load
 ['file', 'fileAny'].forEach(id => $(id).addEventListener('change', e => {
@@ -226,7 +230,8 @@ function drawRotated(ctx, frame, w, h, rot) {
   Parts are cut on frame boundaries and every part starts with a keyframe.
   Frame record (all u32 little-endian):
     u32 opCount
-    opCount x { u32 skip, u32 lit, lit*bpp bytes }   bpp = 3 (RGB, alpha=255) or 4 (RGBA), see meta.rgb
+    opCount x { u32 skip, u32 lit, lit*bpp bytes }   bpp = meta.bpp: 4 RGBA, 3 RGB (alpha=255), 2 RGB565
+    RGB565 pixel = u16 LE, (r8>>3)<<11 | (g8>>2)<<5 | b8>>3. Expand: r8=(r5<<3)|(r5>>2), g8=(g6<<2)|(g6>>4), b8=(b5<<3)|(b5>>2), alpha 255.
   skip = pixels left unchanged since the previous frame, lit = pixels that follow.
   Keyframe = one op: skip 0, lit = every pixel. Unchanged frame = opCount 0.
   Each record is optionally LZ4 block-compressed (kept raw if LZ4 doesn't make it smaller).
@@ -236,16 +241,23 @@ function drawRotated(ctx, frame, w, h, rot) {
   The encoder compares against what the decoder will have (recon), so lossy tolerance never drifts.
 */
 function encodeFrame(px, recon, key, tol, rgb) {
-  const n = px.length >> 2;
+  const n = px.length >> 2, q565 = rgb === 2;
+  const r32 = new Uint32Array(recon.buffer, 0, n);
+  const pk = i => { const o = i * 4; return ((px[o] >> 3) << 11) | ((px[o + 1] >> 2) << 5) | (px[o + 2] >> 3); };
   const ops = []; let totalLit = 0;
 
   if (key) {
     ops.push(0, n); totalLit = n;
   } else {
     const p32 = new Uint32Array(px.buffer, px.byteOffset, n);
-    const r32 = new Uint32Array(recon.buffer, 0, n);
     // fast path: identical 32-bit words are skipped without touching channels
     const changed = i => {
+      if (q565) {
+        const a = pk(i), b = r32[i];
+        if (a === b) return false;
+        if (tol === 0) return true;
+        return Math.abs((a >> 11) - (b >> 11)) * 8 > tol || Math.abs(((a >> 5) & 63) - ((b >> 5) & 63)) * 4 > tol || Math.abs((a & 31) - (b & 31)) * 8 > tol;
+      }
       if (p32[i] === r32[i]) return false;
       if (tol === 0) return true;
       const o = i * 4;
@@ -267,7 +279,7 @@ function encodeFrame(px, recon, key, tol, rgb) {
     }
   }
 
-  const out = new Uint8Array(4 + ops.length * 4 + totalLit * (rgb ? 3 : 4));
+  const out = new Uint8Array(4 + ops.length * 4 + totalLit * (q565 ? 2 : rgb ? 3 : 4));
   const dv = new DataView(out.buffer);
   dv.setUint32(0, ops.length >> 1, true);
   let pos = 4, p = 0;
@@ -276,9 +288,12 @@ function encodeFrame(px, recon, key, tol, rgb) {
     dv.setUint32(pos, skip, true); dv.setUint32(pos + 4, lit, true); pos += 8;
     p += skip;
     const a = p * 4, b = (p + lit) * 4;
-    if (rgb) { for (let q = a; q < b; q += 4) { out[pos++] = px[q]; out[pos++] = px[q + 1]; out[pos++] = px[q + 2]; } }
-    else { out.set(px.subarray(a, b), pos); pos += lit * 4; }
-    recon.set(px.subarray(a, b), a);
+    if (q565) { for (let k = p; k < p + lit; k++) { const v = pk(k); out[pos++] = v & 255; out[pos++] = v >> 8; r32[k] = v; } }
+    else {
+      if (rgb) { for (let q = a; q < b; q += 4) { out[pos++] = px[q]; out[pos++] = px[q + 1]; out[pos++] = px[q + 2]; } }
+      else { out.set(px.subarray(a, b), pos); pos += lit * 4; }
+      recon.set(px.subarray(a, b), a);
+    }
     p += lit;
   }
   return out;
@@ -341,7 +356,7 @@ onmessage = e => {
 };`;
 
 // ---------- WASM encoder (delta + LZ4, hand-built module, same output bytes as the JS versions)
-const WASM_B64 = "AGFzbQEAAAABLAVgBH9/f38Bf2AGf39/f39/AX9gB39/f39/f38Bf2ACf38Bf2AEf39/fwF/AwYFAAECAwQFAwEAAQcVAwNtZW0CAAVkZWx0YQACA2x6NAAECugJBY0CAQN/IAJBBGwhBCAAIARqKAIAIQUgASAEaigCACEGIAUgBkYEQEEADwsgA0EARgRAQQEPCyAAIARqLQAAIAEgBGotAABrIAEgBGotAAAgACAEai0AAGsgACAEai0AACABIARqLQAASxsgA0sEf0EBBSAAIARqQQFqLQAAIAEgBGpBAWotAABrIAEgBGpBAWotAAAgACAEakEBai0AAGsgACAEakEBai0AACABIARqQQFqLQAASxsgA0sLBH9BAQUgACAEakECai0AACABIARqQQJqLQAAayABIARqQQJqLQAAIAAgBGpBAmotAABrIAAgBGpBAmotAAAgASAEakECai0AAEsbIANLCw9BAAuMAQECfyAAIANBBGxqIQYgBiAEQQRsaiEHAkADQCAGIAdJRQ0BIAUEQCACIAYtAAA6AAAgAkEBaiAGQQFqLQAAOgAAIAJBAmogBkECai0AADoAACACQQNqIQIFIAIgBigCADYCACACQQRqIQILIAEgBiAAa2ogBigCADYCACAGQQRqIQYMAAsLIAIPQQALsQIBCH8gBkEEaiEHQQAhDiADBEAgB0EANgIAIAdBBGogAjYCACAHQQhqIQcgACABIAdBACACIAUQASEHQQEhDgVBACEIQQAhCQJAA0AgCCACSUUNAQJAA0AgCCACSQR/IAAgASAIIAQQAEUFQQALRQ0BIAhBAWohCAwACwsgCCACTwRADAILIAghCiAIQQFqIQtBACEMIAhBAWohDQJAA0AgDSACSUUNASAAIAEgDSAEEAAEQCANQQFqIQtBACEMBSAMQQFqIQwgDEECSwRADAMLCyANQQFqIQ0MAAsLIAcgCiAJazYCACAHQQRqIAsgCms2AgAgB0EIaiEHIAAgASAHIAogCyAKayAFEAEhByAOQQFqIQ4gCyEJIAshCAwACwsLIAYgDjYCACAHIAZrD0EACzkAAkADQCABQf8BT0UNASAAQf8BOgAAIABBAWohACABQf8BayEBDAALCyAAIAE6AAAgAEEBag9BAAvbAwEMfyACIQRBACEFQQAhBiABQQ1PBEAgA0EAQYCAEPwLACABQQVrIQcgAUEMayEIAkADQCAGIAhNRQ0BIAAgBmooAgAhCSAJQbHz3fF5bEEQdiEKIAMgCkEEbGooAgAhCyADIApBBGxqIAZBAWo2AgAgC0EARwR/IAZBAWogC2tB//8DTQVBAAsEfyAAIAtqQQFrKAIAIAlGBUEACwRAIAtBAWshC0EEIQwCQANAIAYgDGogB0kEfyAAIAtqIAxqLQAAIAAgBmogDGotAABGBUEAC0UNASAMQQFqIQwMAAsLIAYgBWshDSAMQQRrIQ4gBiALayEPIAQgDUEPIA1BD0kbQQR0IA5BDyAOQQ9JG3I6AAAgBEEBaiEEIA1BD08EQCAEIA1BD2sQAyEECyAEIAAgBWogDfwKAAAgBCANaiEEIAQgD0H/AXE6AAAgBEEBaiAPQQh2OgAAIARBAmohBCAOQQ9PBEAgBCAOQQ9rEAMhBAsgBiAMaiEGIAYhBQUgBkEBaiEGCwwACwsLIAEgBWshDSAEIA1BDyANQQ9JG0EEdDoAACAEQQFqIQQgDUEPTwRAIAQgDUEPaxADIQQLIAQgACAFaiAN/AoAACAEIA1qIQQgBCACaw9BAAs=";
+const WASM_B64 = "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";
 function wasmEnc(bytes, nPix) {
   const ex = new WebAssembly.Instance(new WebAssembly.Module(bytes), {}).exports;
   const HT = 0, PX = 262144, RC = PX + nPix * 4, REC = RC + nPix * 4;
@@ -350,7 +365,7 @@ function wasmEnc(bytes, nPix) {
   const u8 = new Uint8Array(ex.mem.buffer);
   return (px, key, tol, rgb, useLz4) => {
     u8.set(new Uint8Array(px.buffer, px.byteOffset, px.length), PX);
-    const len = ex.delta(PX, RC, nPix, key ? 1 : 0, tol, rgb ? 1 : 0, REC);
+    const len = ex.delta(PX, RC, nPix, key ? 1 : 0, tol, rgb | 0, REC);
     if (useLz4) { const c = ex.lz4(REC, len, LZ, HT); if (c < len) return { st: u8.slice(LZ, LZ + c), raw: len }; }
     return { st: u8.slice(REC, REC + len), raw: len };
   };
@@ -483,7 +498,7 @@ async function extractFramesParallel(onProgress) {
   const { track, samples, rot } = dm, ts = track.timescale;
   const { w, h } = dims(), { start } = range(), fps = val('fps'), total = frameTotal();
   const keyEvery = Math.max(1, Math.floor(val('keyEvery'))), tol = Math.max(0, val('tol'));
-  const rgb = $('rgb').checked, useLz4 = $('lz4').checked;
+  const rgb = pixFmt(), useLz4 = $('lz4').checked;
   const maxPart = Math.max(1, val('partMB')) * 1048576;
   const cfg = { codec: track.codec, codedWidth: track.video.width, codedHeight: track.video.height, description: getDescription(dm.mp4, track) };
   if (!(await VideoDecoder.isConfigSupported(cfg)).supported) throw new Error('decoder config unsupported');
@@ -572,7 +587,7 @@ async function extractFrames(onProgress) {
 async function extractFramesSerial(onProgress) {
   const { w, h } = dims(), { start } = range(), fps = val('fps'), total = frameTotal();
   const keyEvery = Math.max(1, Math.floor(val('keyEvery'))), tol = Math.max(0, val('tol'));
-  const rgb = $('rgb').checked, useLz4 = $('lz4').checked;
+  const rgb = pixFmt(), useLz4 = $('lz4').checked;
   const maxPart = Math.max(1, val('partMB')) * 1048576;
   const cv = new OffscreenCanvas(w, h);
   const ctx = cv.getContext('2d', { willReadFrequently: true });
@@ -757,7 +772,7 @@ $('go').addEventListener('click', async () => {
     const one = fr.parts.length === 1;
     const pname = i => one ? 'video.bin' : `video_${String(i + 1).padStart(3, '0')}.bin`;
     const meta = {
-      format: fr.rgb ? 'rgb8-delta3' : 'rgba8-delta3', rgb: fr.rgb, width: fr.width, height: fr.height,
+      format: ['rgba8-delta3', 'rgb8-delta3', 'rgb565-delta3'][fr.rgb], rgb: fr.rgb === 1, bpp: [4, 3, 2][fr.rgb], width: fr.width, height: fr.height,
       lz4: fr.lz4, maxRaw: fr.maxRaw, count: fr.count, fps: val('fps'), keyEvery: fr.keyEvery,
       videoBytes: fr.bytes,
       parts: fr.parts.map((p, i) => ({ name: pname(i), firstFrame: p.first, bytes: p.bytes })),
