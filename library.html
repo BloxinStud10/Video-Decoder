@@ -187,7 +187,7 @@ function render() {
       lastGroup = x.group;
     }
     const row = document.createElement('div'); row.className = 'item';
-    const name = document.createElement('div'); name.className = 'name'; name.textContent = x.name;
+    const name = document.createElement('div'); name.className = 'name'; name.textContent = x.name.replace(/\.zip$/i, ''); name.title = x.name;
     const size = document.createElement('div'); size.className = 'size'; size.textContent = mb(x.size);
     const btn = document.createElement('button'); btn.textContent = 'Download';
     btn.addEventListener('click', () => download(x, btn));
