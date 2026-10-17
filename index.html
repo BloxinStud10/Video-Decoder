@@ -73,6 +73,7 @@
 
 <video id="v" muted playsinline preload="auto"></video>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
@@ -85,6 +86,7 @@ const even = n => Math.max(2, Math.round(n / 2) * 2);
 const log = t => { $('log').textContent = t; };
 const mb = b => (b / 1048576).toFixed(1) + ' MB';
 const yieldUI = () => new Promise(r => { const c = new MessageChannel(); c.port1.onmessage = () => r(); c.port2.postMessage(0); });
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function dims() {
   const w = even(val('width')), h = even(w * v.videoHeight / v.videoWidth);
@@ -128,6 +130,94 @@ const seek = t => new Promise(res => {
   v.addEventListener('seeked', done);
   v.currentTime = t;
 });
+
+// ---------- WebCodecs decoding (MP4/MOV via mp4box; falls back to seek loop otherwise)
+const hasWC = () => 'VideoDecoder' in window && typeof MP4Box !== 'undefined';
+
+function getDescription(mp4, track) {
+  const trak = mp4.getTrackById(track.id);
+  for (const e of trak.mdia.minf.stbl.stsd.entries) {
+    const box = e.avcC || e.hvcC;
+    if (box) {
+      const s = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
+      box.write(s);
+      return new Uint8Array(s.buffer, 8);
+    }
+  }
+  return undefined; // vp9 / av1 need no description
+}
+
+async function demux(file) {
+  const mp4 = MP4Box.createFile();
+  const samples = []; let track = null, err = null;
+  mp4.onError = e => { err = e; };
+  mp4.onReady = info => {
+    track = info.videoTracks[0];
+    if (track) { mp4.setExtractionOptions(track.id, null, { nbSamples: 1e6 }); mp4.start(); }
+  };
+  mp4.onSamples = (id, u, s) => { for (const x of s) samples.push(x); };
+  const CH = 8 << 20;
+  for (let o = 0; o < file.size; o += CH) {
+    const b = await file.slice(o, o + CH).arrayBuffer();
+    b.fileStart = o; mp4.appendBuffer(b);
+  }
+  mp4.flush();
+  if (err || !track || !samples.length) throw new Error('demux failed');
+  const m = track.matrix || [65536, 0];
+  const rot = (Math.round(Math.atan2(m[1], m[0]) * 180 / Math.PI) + 360) % 360;
+  return { mp4, track, samples, rot };
+}
+
+// Yields VideoFrames in presentation order, starting from the keyframe before startSec.
+async function* decodeFrames(dm, startSec) {
+  const { mp4, track, samples } = dm, ts = track.timescale;
+  let first = 0;
+  samples.forEach((s, i) => { if (s.is_sync && s.cts / ts <= startSec) first = i; });
+  const q = []; let err = null, finished = false, stop = false;
+  const dec = new VideoDecoder({ output: f => q.push(f), error: e => { err = e; } });
+  dec.configure({
+    codec: track.codec,
+    codedWidth: track.video.width, codedHeight: track.video.height,
+    description: getDescription(mp4, track),
+  });
+  (async () => {
+    try {
+      for (let i = first; i < samples.length && !err && !stop; i++) {
+        while ((dec.decodeQueueSize > 16 || q.length > 8) && !err && !stop) await sleep(2);
+        const s = samples[i];
+        dec.decode(new EncodedVideoChunk({
+          type: s.is_sync ? 'key' : 'delta',
+          timestamp: Math.round(s.cts * 1e6 / ts),
+          duration: Math.round(s.duration * 1e6 / ts),
+          data: s.data,
+        }));
+      }
+      if (!stop) await dec.flush();
+    } catch (e) { err = err || e; }
+    finished = true;
+  })();
+  try {
+    for (;;) {
+      if (q.length) yield q.shift();
+      else if (err) throw err;
+      else if (finished) return;
+      else await sleep(1);
+    }
+  } finally {
+    stop = true;
+    q.forEach(f => f.close());
+    if (dec.state !== 'closed') dec.close();
+  }
+}
+
+function drawRotated(ctx, frame, w, h, rot) {
+  ctx.save();
+  ctx.translate(w / 2, h / 2);
+  ctx.rotate(rot * Math.PI / 180);
+  const sw = rot % 180 ? h : w, sh = rot % 180 ? w : h;
+  ctx.drawImage(frame, -sw / 2, -sh / 2, sw, sh);
+  ctx.restore();
+}
 
 /*
   video part files (video.bin, or video_001.bin, video_002.bin... when split).
@@ -227,6 +317,27 @@ function lz4Block(src) {
   return dst.subarray(0, d);
 }
 
+// ---------- encode worker: delta + LZ4 + part splitting run off the main thread
+const workerSrc = `
+const lzTable = new Int32Array(1 << 16);
+${encodeFrame}
+${lz4Block}
+let recon = null, partBytes = 0;
+const pack = (rec, useLz4) => { if (useLz4) { const c = lz4Block(rec); if (c.length < rec.length) return c; } return rec; };
+onmessage = e => {
+  const m = e.data;
+  if (m.init) { recon = new Uint8Array(m.size); partBytes = 0; return; }
+  const px = new Uint8ClampedArray(m.buf);
+  let rec = encodeFrame(px, recon, m.key, m.tol, m.rgb), stored = pack(rec, m.lz4), newPart = false;
+  if (partBytes > 0 && partBytes + stored.length > m.maxPart) {
+    newPart = true; partBytes = 0;
+    if (!m.key) { rec = encodeFrame(px, recon, true, m.tol, m.rgb); stored = pack(rec, m.lz4); } // every part starts on a keyframe
+  }
+  const offset = partBytes; partBytes += stored.length;
+  const out = stored.byteLength === stored.buffer.byteLength ? stored : stored.slice();
+  postMessage({ n: m.n, stored: out, rawLen: rec.length, newPart, offset }, [out.buffer]);
+};`;
+
 async function extractFrames(onProgress) {
   const { w, h } = dims(), { start } = range(), fps = val('fps'), total = frameTotal();
   const keyEvery = Math.max(1, Math.floor(val('keyEvery'))), tol = Math.max(0, val('tol'));
@@ -235,32 +346,73 @@ async function extractFrames(onProgress) {
   const cv = new OffscreenCanvas(w, h);
   const ctx = cv.getContext('2d', { willReadFrequently: true });
   ctx.imageSmoothingQuality = 'high';
-  const recon = new Uint8Array(w * h * 4);
   const offsets = new Uint32Array(total * 3); // [offset in part, stored len, raw len]
   const parts = []; let blobs = [], batch = [], partBytes = 0, partFirst = 0, bytes = 0, maxRaw = 0, n = 0;
   const flush = () => { if (batch.length) { blobs.push(new Blob(batch)); batch = []; } }; // spill to Blob, keeps heap small
   const closePart = next => { flush(); parts.push({ blob: new Blob(blobs), bytes: partBytes, first: partFirst }); blobs = []; partBytes = 0; partFirst = next; };
-  const pack = rec => { if (useLz4) { const c = lz4Block(rec); if (c.length < rec.length) return c; } return rec; };
-  let lastYield = performance.now();
-  for (; n < total; n++) {
-    if (cancelled) throw new Error('cancelled');
-    await seek(start + n / fps + 0.0005);
-    ctx.drawImage(v, 0, 0, w, h);
-    const px = ctx.getImageData(0, 0, w, h).data;
-    const key = n % keyEvery === 0;
-    let rec = encodeFrame(px, recon, key, tol, rgb), stored = pack(rec);
-    if (partBytes > 0 && partBytes + stored.length > maxPart) {
-      closePart(n);
-      if (!key) { rec = encodeFrame(px, recon, true, tol, rgb); stored = pack(rec); } // every part starts on a keyframe
-    }
-    if (rec.length > maxRaw) maxRaw = rec.length;
-    offsets[n * 3] = partBytes; offsets[n * 3 + 1] = stored.length; offsets[n * 3 + 2] = rec.length;
-    partBytes += stored.length; bytes += stored.length; batch.push(stored);
+  // worker: results come back in order, at most 4 frames in flight
+  const worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' })));
+  let inflight = 0, waiter = null, werr = null;
+  const wake = () => { if (waiter) { const r = waiter; waiter = null; r(); } };
+  const until = async fn => { while (!fn()) { if (werr) throw werr; await new Promise(r => { waiter = r; }); } if (werr) throw werr; };
+  worker.onerror = e => { werr = new Error(e.message || 'worker error'); wake(); };
+  worker.onmessage = e => {
+    const r = e.data;
+    if (r.newPart) closePart(r.n);
+    if (r.rawLen > maxRaw) maxRaw = r.rawLen;
+    offsets[r.n * 3] = r.offset; offsets[r.n * 3 + 1] = r.stored.length; offsets[r.n * 3 + 2] = r.rawLen;
+    partBytes += r.stored.length; bytes += r.stored.length; batch.push(r.stored);
     if (batch.length >= 256) flush();
-    if (performance.now() - lastYield > 100) { onProgress(n / total); await yieldUI(); lastYield = performance.now(); }
+    inflight--; wake();
+  };
+  worker.postMessage({ init: true, size: w * h * 4 });
+
+  // WebCodecs source (falls back to seeking if unsupported or demux fails)
+  let dm = null, it = null, cur = null, nxt = null;
+  if (hasWC()) {
+    try {
+      dm = await demux(fileObj);
+      it = decodeFrames(dm, start);
+      cur = (await it.next()).value;
+      nxt = (await it.next()).value;
+      if (!cur) throw new Error('no frames');
+    } catch (e) {
+      dm = null;
+      if (cur) { cur.close(); cur = null; }
+      if (nxt) { nxt.close(); nxt = null; }
+      if (it) { try { await it.return(); } catch {} it = null; }
+    }
+  }
+
+  let lastYield = performance.now();
+  try {
+    for (; n < total; n++) {
+      if (cancelled) throw new Error('cancelled');
+      if (dm) {
+        const target = (start + n / fps) * 1e6;
+        while (nxt && nxt.timestamp <= target) {
+          cur.close(); cur = nxt; nxt = (await it.next()).value;
+        }
+        drawRotated(ctx, cur, w, h, dm.rot);
+      } else {
+        await seek(start + n / fps + 0.0005);
+        ctx.drawImage(v, 0, 0, w, h);
+      }
+      const px = ctx.getImageData(0, 0, w, h).data;
+      await until(() => inflight < 4);
+      inflight++;
+      worker.postMessage({ n, buf: px.buffer, key: n % keyEvery === 0, tol, rgb, lz4: useLz4, maxPart }, [px.buffer]);
+      if (performance.now() - lastYield > 100) { onProgress(n / total); await yieldUI(); lastYield = performance.now(); }
+    }
+    await until(() => inflight === 0);
+  } finally {
+    worker.terminate();
+    if (cur) cur.close();
+    if (nxt) nxt.close();
+    if (it) { try { await it.return(); } catch {} }
   }
   if (partBytes > 0 || !parts.length) closePart(n);
-  return { parts, offsets, bytes, width: w, height: h, count: n, keyEvery, maxRaw, lz4: useLz4, rgb, raw: w * h * 4 * n };
+  return { parts, offsets, bytes, width: w, height: h, count: n, keyEvery, maxRaw, lz4: useLz4, rgb, raw: w * h * 4 * n, wc: !!dm };
 }
 
 // ---------- audio -> mp3
@@ -385,7 +537,7 @@ $('go').addEventListener('click', async () => {
       addDl(await makeZip(files), 'video-data.zip');
     }
     files.forEach(f => addDl(f.blob, f.name));
-    log(`Done in ${((performance.now() - t0) / 1000).toFixed(1)}s · ${fr.count} frames ${fr.width}×${fr.height} · ${fr.parts.length} part(s)\n` +
+    log(`Done in ${((performance.now() - t0) / 1000).toFixed(1)}s · ${fr.count} frames ${fr.width}×${fr.height} · ${fr.parts.length} part(s) · ${fr.wc ? 'WebCodecs' : 'seek'} decode\n` +
         `video ${mb(fr.bytes)} vs ${mb(fr.raw)} raw RGBA (${(fr.raw / Math.max(1, fr.bytes)).toFixed(1)}x smaller)` +
         (audio ? '' : $('audio').checked ? '\nNo audio track found' : ''));
   } catch (e) {
