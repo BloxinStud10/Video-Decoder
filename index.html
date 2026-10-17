@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Video → delta frames + MP3</title>
+<title>Video → RGBA Frames + MP3</title>
 <style>
   :root { --bg:#14161a; --card:#1d2026; --fg:#e8eaed; --mut:#9aa0a6; --acc:#4f8cff; --bd:#2c3038; }
   @media (prefers-color-scheme: light) { :root { --bg:#f4f5f7; --card:#fff; --fg:#1b1d21; --mut:#6b7280; --bd:#dcdfe4; } }
@@ -338,7 +338,160 @@ onmessage = e => {
   postMessage({ n: m.n, stored: out, rawLen: rec.length, newPart, offset }, [out.buffer]);
 };`;
 
+// ---------- parallel path: each worker decodes + scales + encodes its own range of frames
+const pworkerSrc = `
+const lzTable = new Int32Array(1 << 16);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+${encodeFrame}
+${lz4Block}
+${drawRotated}
+onmessage = e => run(e.data).catch(err => postMessage({ error: String((err && err.message) || err) }));
+async function run(m) {
+  const { samples, ts, cfg, w, h, rot, fps, start, f0, f1, keyEvery, tol, rgb, lz4 } = m;
+  const ctx = new OffscreenCanvas(w, h).getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  const recon = new Uint8Array(w * h * 4);
+  const q = []; let err = null, finished = false, stop = false;
+  const dec = new VideoDecoder({ output: f => q.push(f), error: e => { err = e; } });
+  dec.configure(cfg);
+  (async () => {
+    try {
+      for (let i = 0; i < samples.length && !err && !stop; i++) {
+        while ((dec.decodeQueueSize > 16 || q.length > 8) && !err && !stop) await sleep(2);
+        const s = samples[i];
+        dec.decode(new EncodedVideoChunk({ type: s.sync ? 'key' : 'delta', timestamp: Math.round(s.cts * 1e6 / ts), duration: Math.round(s.dur * 1e6 / ts), data: s.data }));
+      }
+      if (!stop) await dec.flush();
+    } catch (e) { err = err || e; }
+    finished = true;
+  })();
+  const T = { dec: 0, draw: 0, enc: 0 };
+  const next = async () => {
+    const t = performance.now();
+    for (;;) {
+      if (q.length) { T.dec += performance.now() - t; return q.shift(); }
+      if (err) throw err;
+      if (finished) return null;
+      await sleep(1);
+    }
+  };
+  let cur = await next(), nxt = await next();
+  if (!cur) throw new Error('no frames decoded');
+  let frames = [], raws = [], first = f0;
+  for (let n = f0; n < f1; n++) {
+    const target = (start + n / fps) * 1e6;
+    while (nxt && nxt.timestamp <= target) { cur.close(); cur = nxt; nxt = await next(); }
+    let t = performance.now();
+    drawRotated(ctx, cur, w, h, rot);
+    const px = ctx.getImageData(0, 0, w, h).data;
+    T.draw += performance.now() - t; t = performance.now();
+    const rec = encodeFrame(px, recon, n % keyEvery === 0, tol, rgb);
+    let st = rec;
+    if (lz4) { const c = lz4Block(rec); if (c.length < rec.length) st = c.slice(); }
+    T.enc += performance.now() - t;
+    frames.push(st); raws.push(rec.length);
+    if (frames.length === keyEvery || n === f1 - 1) {
+      postMessage({ block: first / keyEvery, frames, raws }, frames.map(f => f.buffer));
+      frames = []; raws = []; first = n + 1;
+    }
+  }
+  stop = true; cur.close(); if (nxt) nxt.close();
+  q.forEach(f => f.close());
+  if (dec.state !== 'closed') dec.close();
+  postMessage({ done: true, T });
+}`;
+
+async function extractFramesParallel(onProgress) {
+  const dm = await demux(fileObj);
+  const { track, samples, rot } = dm, ts = track.timescale;
+  const { w, h } = dims(), { start } = range(), fps = val('fps'), total = frameTotal();
+  const keyEvery = Math.max(1, Math.floor(val('keyEvery'))), tol = Math.max(0, val('tol'));
+  const rgb = $('rgb').checked, useLz4 = $('lz4').checked;
+  const maxPart = Math.max(1, val('partMB')) * 1048576;
+  const cfg = { codec: track.codec, codedWidth: track.video.width, codedHeight: track.video.height, description: getDescription(dm.mp4, track) };
+  if (!(await VideoDecoder.isConfigSupported(cfg)).supported) throw new Error('decoder config unsupported');
+  const nBlocks = Math.ceil(total / keyEvery);
+  const W = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1, nBlocks));
+  const per = Math.ceil(nBlocks / W);
+
+  // source samples a worker needs: from the keyframe before its start to the first keyframe after its end
+  const slice = (t0, t1) => {
+    let a = 0; samples.forEach((s, i) => { if (s.is_sync && s.cts / ts <= t0) a = i; });
+    let b = samples.length;
+    for (let i = a + 1; i < samples.length; i++) if (samples[i].is_sync && samples[i].cts / ts > t1) { b = i; break; }
+    const out = [], tr = [];
+    for (let i = a; i < b; i++) {
+      const s = samples[i], d = new Uint8Array(s.data);
+      out.push({ sync: s.is_sync, cts: s.cts, dur: s.duration, data: d }); tr.push(d.buffer);
+    }
+    return { out, tr };
+  };
+
+  const offsets = new Uint32Array(total * 3); // [offset in part, stored len, raw len]
+  const parts = []; let blobs = [], partBytes = 0, partFirst = 0, bytes = 0, maxRaw = 0;
+  const closePart = next => { parts.push({ blob: new Blob(blobs), bytes: partBytes, first: partFirst }); blobs = []; partBytes = 0; partFirst = next; };
+  const pending = new Map(); let nextBlock = 0, doneFrames = 0;
+  const assemble = () => { // blocks may arrive out of order; append strictly in order, parts split on block boundaries
+    while (pending.has(nextBlock)) {
+      const b = pending.get(nextBlock); pending.delete(nextBlock);
+      const first = nextBlock * keyEvery, size = b.lens.reduce((x, y) => x + y, 0);
+      if (partBytes > 0 && partBytes + size > maxPart) closePart(first);
+      b.lens.forEach((len, i) => {
+        const f = first + i;
+        offsets[f * 3] = partBytes; offsets[f * 3 + 1] = len; offsets[f * 3 + 2] = b.raws[i];
+        partBytes += len; bytes += len; if (b.raws[i] > maxRaw) maxRaw = b.raws[i];
+      });
+      blobs.push(b.blob); nextBlock++;
+    }
+  };
+
+  const url = URL.createObjectURL(new Blob([pworkerSrc], { type: 'text/javascript' }));
+  const workers = [], T = { dec: 0, draw: 0, enc: 0 };
+  try {
+    await new Promise((resolve, reject) => {
+      const poll = setInterval(() => { if (cancelled) { clearInterval(poll); reject(new Error('cancelled')); } }, 100);
+      const fail = e => { clearInterval(poll); reject(e); };
+      let finished = 0;
+      for (let k = 0; k < W; k++) {
+        const bk0 = k * per, bk1 = Math.min(nBlocks, (k + 1) * per);
+        if (bk0 >= bk1) continue;
+        const f0 = bk0 * keyEvery, f1 = Math.min(total, bk1 * keyEvery);
+        const { out, tr } = slice(start + f0 / fps, start + f1 / fps + 0.5);
+        const wk = new Worker(url); workers.push(wk);
+        wk.onerror = e => fail(new Error(e.message || 'worker error'));
+        wk.onmessage = e => {
+          const r = e.data;
+          if (r.error) return fail(new Error(r.error));
+          if (r.done) {
+            T.dec += r.T.dec / 1000; T.draw += r.T.draw / 1000; T.enc += r.T.enc / 1000;
+            if (++finished === workers.length) { clearInterval(poll); resolve(); }
+            return;
+          }
+          pending.set(r.block, { blob: new Blob(r.frames), lens: r.frames.map(f => f.byteLength), raws: r.raws });
+          doneFrames += r.raws.length; assemble(); onProgress(doneFrames / total);
+        };
+        wk.postMessage({ samples: out, ts, cfg, w, h, rot, fps, start, f0, f1, keyEvery, tol, rgb, lz4: useLz4 }, tr);
+      }
+    });
+  } finally { workers.forEach(x => x.terminate()); URL.revokeObjectURL(url); }
+  if (nextBlock !== nBlocks) throw new Error('missing blocks');
+  if (partBytes > 0 || !parts.length) closePart(total);
+  return { parts, offsets, bytes, width: w, height: h, count: total, keyEvery, maxRaw, lz4: useLz4, rgb, raw: w * h * 4 * total, wc: true, timing: { ...T, workers: workers.length } };
+}
+
 async function extractFrames(onProgress) {
+  if (hasWC()) {
+    try { return await extractFramesParallel(onProgress); }
+    catch (e) {
+      if (cancelled || e.message === 'cancelled') throw new Error('cancelled');
+      console.warn('parallel path failed, using single thread:', e);
+      log('Parallel path failed (' + e.message + '), using single thread…');
+    }
+  }
+  return extractFramesSerial(onProgress);
+}
+
+async function extractFramesSerial(onProgress) {
   const { w, h } = dims(), { start } = range(), fps = val('fps'), total = frameTotal();
   const keyEvery = Math.max(1, Math.floor(val('keyEvery'))), tol = Math.max(0, val('tol'));
   const rgb = $('rgb').checked, useLz4 = $('lz4').checked;
@@ -514,7 +667,11 @@ $('go').addEventListener('click', async () => {
     const total = frameTotal();
     if (!total) throw new Error('No frames in the selected range.');
     const t0 = performance.now();
-    const fr = await extractFrames(p => { $('bar').value = p; log(`Extracting frames… ${(p * 100).toFixed(0)}%`); });
+    const fr = await extractFrames(p => {
+      $('bar').value = p;
+      log(`Extracting frames… ${Math.min(total, Math.round(p * total))} / ${total} (${(p * 100).toFixed(0)}%) · ${((performance.now() - t0) / 1000).toFixed(1)}s elapsed`);
+    });
+    const tFrames = (performance.now() - t0) / 1000;
 
     let audio = null;
     if ($('audio').checked) { log('Encoding MP3…'); $('bar').removeAttribute('value'); audio = await extractMp3(); }
@@ -537,7 +694,8 @@ $('go').addEventListener('click', async () => {
       addDl(await makeZip(files), 'video-data.zip');
     }
     files.forEach(f => addDl(f.blob, f.name));
-    log(`Done in ${((performance.now() - t0) / 1000).toFixed(1)}s · ${fr.count} frames ${fr.width}×${fr.height} · ${fr.parts.length} part(s) · ${fr.wc ? 'WebCodecs' : 'seek'} decode\n` +
+    log(`Done in ${((performance.now() - t0) / 1000).toFixed(1)}s (frames: ${tFrames.toFixed(1)}s, ${(fr.count / tFrames).toFixed(1)} fps) · ${fr.count} / ${total} frames ${fr.width}×${fr.height} · ${fr.parts.length} part(s) · ${fr.wc ? 'WebCodecs' : 'seek'} decode\n` +
+        (fr.timing ? `cpu-s over ${fr.timing.workers} workers: decode-wait ${fr.timing.dec.toFixed(1)} · draw ${fr.timing.draw.toFixed(1)} · encode ${fr.timing.enc.toFixed(1)}\n` : '') +
         `video ${mb(fr.bytes)} vs ${mb(fr.raw)} raw RGBA (${(fr.raw / Math.max(1, fr.bytes)).toFixed(1)}x smaller)` +
         (audio ? '' : $('audio').checked ? '\nNo audio track found' : ''));
   } catch (e) {
