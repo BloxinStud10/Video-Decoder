@@ -57,6 +57,7 @@
       <label>Pixel tolerance (0 = lossless, 0–255)<input type="number" id="tol" value="2" min="0" max="255" step="1"></label>
       <label>Keyframe every (frames)<input type="number" id="keyEvery" value="40" min="1" max="1000"></label>
       <label>Max part size (MB)<input type="number" id="partMB" value="20" min="1" max="500"></label>
+      <label>DCT quant step (higher = smaller)<input type="number" id="qstep" value="6" min="1" max="64" step="1"></label>
     </div>
     <div class="row" style="margin-top:10px">
       <label class="chk"><input type="checkbox" id="audio" checked> Extract audio</label>
@@ -64,6 +65,7 @@
       <label class="chk"><input type="checkbox" id="lz4" checked> LZ4 compress frames</label>
       <label class="chk"><input type="checkbox" id="rgb" checked> Drop alpha (RGB, -25%)</label>
       <label class="chk"><input type="checkbox" id="f565"> RGB565 (2 bytes/px, overrides RGB)</label>
+      <label class="chk"><input type="checkbox" id="dct"> MP4-style lossy (YUV 4:2:0 + DCT, overrides RGB/565)</label>
       <label class="chk"><input type="checkbox" id="zip" checked> Also make ZIP (slower)</label>
       <label class="chk"><input type="checkbox" id="wasm" checked> WASM encode (faster)</label>
       <label class="chk"><input type="checkbox" id="gpu"> GPU scale + readback (experimental)</label>
@@ -106,7 +108,8 @@ const yieldUI = () => new Promise(r => { const c = new MessageChannel(); c.port1
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function dims() {
-  const w = even(val('width')), h = even(w * v.videoHeight / v.videoWidth);
+  const m = $('dct').checked ? 16 : 2, e = n => Math.max(m, Math.round(n / m) * m);
+  const w = e(val('width')), h = e(w * v.videoHeight / v.videoWidth);
   return { w, h };
 }
 function range() {
@@ -121,14 +124,14 @@ function frameTotal() {
   return Math.max(0, n);
 }
 // 0 = RGBA, 1 = RGB, 2 = RGB565
-const pixFmt = () => $('f565').checked ? 2 : $('rgb').checked ? 1 : 0;
-const pixFmtBpp = () => [4, 3, 2][pixFmt()];
+const pixFmt = () => $('dct').checked ? 3 : $('f565').checked ? 2 : $('rgb').checked ? 1 : 0;
+const pixFmtBpp = () => [4, 3, 2, 1.5][pixFmt()];
 function estimate() {
   if (!v.videoWidth) return;
   const { w, h } = dims(), n = frameTotal();
   $('est').textContent = `${w}×${h}, ${n} frames, worst case ~${mb(w * h * pixFmtBpp() * n)} (delta coding is usually far smaller)`;
 }
-['width','fps','start','end','maxFrames','rgb','f565'].forEach(id => $(id).addEventListener('input', estimate));
+['width','fps','start','end','maxFrames','rgb','f565','dct'].forEach(id => $(id).addEventListener('input', estimate));
 
 // ---------- load
 ['file', 'fileAny'].forEach(id => $(id).addEventListener('change', e => {
@@ -264,6 +267,7 @@ function drawRotated(ctx, frame, w, h, rot) {
   The encoder compares against what the decoder will have (recon), so lossy tolerance never drifts.
 */
 function encodeFrame(px, recon, key, tol, rgb) {
+  if (rgb === 3) return encodeDct(px, recon, key, tol);
   const n = px.length >> 2, q565 = rgb === 2;
   const r32 = new Uint32Array(recon.buffer, 0, n);
   const pk = i => { const o = i * 4; return ((px[o] >> 3) << 11) | ((px[o + 1] >> 2) << 5) | (px[o + 2] >> 3); };
@@ -357,16 +361,85 @@ function lz4Block(src) {
   return dst.subarray(0, d);
 }
 
+
+/*
+  MP4-style lossy mode (meta.dct = true). Per frame, no header, macroblocks in raster order (16x16 luma):
+    per macroblock: 4 luma 8x8 blocks (TL, TR, BL, BR), then Cb block, then Cr block (chroma is 4:2:0).
+    per block: u8 nz (0 = unchanged); else int16 LE coef[0], then (nz-1) int8 coefs, JPEG zigzag order.
+    dequant: c * q * (1 + 0.15*(u+v)); inverse DCT is added onto the previous reconstruction (P-frame residual).
+    Keyframe: predictor is flat 128 in every plane. Parts always start on a keyframe.
+*/
+const DCT_SRC = `
+let DW = 0, DH = 0, DB = null;
+const ZZ = [0,1,8,16,9,2,3,10,17,24,32,25,18,11,4,5,12,19,26,33,40,48,41,34,27,20,13,6,7,14,21,28,35,42,49,56,57,50,43,36,29,22,15,23,30,37,44,51,58,59,52,45,38,31,39,46,53,60,61,54,47,55,62,63];
+const dRes = new Float64Array(64), dAcc = new Float64Array(64), dQc = new Int16Array(64);
+function dctInit() {
+  if (DB) return;
+  DB = new Float64Array(4096);
+  for (let i = 0; i < 64; i++) {
+    const u = i >> 3, vv = i & 7, au = u ? 0.5 : Math.sqrt(0.125), av = vv ? 0.5 : Math.sqrt(0.125);
+    for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++)
+      DB[i * 64 + y * 8 + x] = au * av * Math.cos((2 * y + 1) * u * Math.PI / 16) * Math.cos((2 * x + 1) * vv * Math.PI / 16);
+  }
+}
+function dctBlock(cur, rec, stride, x0, y0, q, out, pos) {
+  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) { const j = (y0 + y) * stride + x0 + x; dRes[y * 8 + x] = cur[j] - rec[j]; }
+  let last = 0;
+  for (let k = 0; k < 64; k++) {
+    const idx = ZZ[k], base = idx * 64, qs = q * (1 + 0.15 * ((idx >> 3) + (idx & 7)));
+    let s = 0; for (let i = 0; i < 64; i++) s += dRes[i] * DB[base + i];
+    let c = s / qs; c = (c < 0 ? -1 : 1) * Math.floor(Math.abs(c) + (k ? 0.4 : 0.5));
+    const lim = k ? 127 : 32767; c = c > lim ? lim : c < -lim ? -lim : c;
+    dQc[k] = c; if (c) last = k + 1;
+  }
+  if (!last) { out[pos++] = 0; return pos; }
+  out[pos++] = last; out[pos++] = dQc[0] & 255; out[pos++] = (dQc[0] >> 8) & 255;
+  for (let k = 1; k < last; k++) out[pos++] = dQc[k] & 255;
+  dAcc.fill(0);
+  for (let k = 0; k < last; k++) {
+    const c = dQc[k]; if (!c) continue;
+    const idx = ZZ[k], base = idx * 64, val = c * (q * (1 + 0.15 * ((idx >> 3) + (idx & 7))));
+    for (let i = 0; i < 64; i++) dAcc[i] += val * DB[base + i];
+  }
+  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+    const j = (y0 + y) * stride + x0 + x, p = Math.floor(rec[j] + dAcc[y * 8 + x] + 0.5);
+    rec[j] = p < 0 ? 0 : p > 255 ? 255 : p;
+  }
+  return pos;
+}
+function encodeDct(px, rec, key, q) {
+  dctInit();
+  const w = DW, h = DH, cw = w >> 1, ch = h >> 1, nY = w * h, nC = cw * ch;
+  const Y = rec.subarray(0, nY), U = rec.subarray(nY, nY + nC), V = rec.subarray(nY + nC, nY + 2 * nC);
+  if (key) rec.fill(128, 0, nY + 2 * nC);
+  const cy = new Float32Array(nY), cu = new Float32Array(nC), cv = new Float32Array(nC);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const o = (y * w + x) * 4, r = px[o], g = px[o + 1], b = px[o + 2], c = (y >> 1) * cw + (x >> 1);
+    cy[y * w + x] = 0.299 * r + 0.587 * g + 0.114 * b;
+    cu[c] += (-0.168736 * r - 0.331264 * g + 0.5 * b + 128) * 0.25;
+    cv[c] += (0.5 * r - 0.418688 * g - 0.081312 * b + 128) * 0.25;
+  }
+  const out = new Uint8Array((w >> 3) * (h >> 3) * 99 + 16); let pos = 0;
+  for (let my = 0; my < h; my += 16) for (let mx = 0; mx < w; mx += 16) {
+    for (let b = 0; b < 4; b++) pos = dctBlock(cy, Y, w, mx + (b & 1) * 8, my + (b >> 1) * 8, q, out, pos);
+    pos = dctBlock(cu, U, cw, mx >> 1, my >> 1, q, out, pos);
+    pos = dctBlock(cv, V, cw, mx >> 1, my >> 1, q, out, pos);
+  }
+  return out.slice(0, pos);
+}
+`;
+
 // ---------- encode worker: delta + LZ4 + part splitting run off the main thread
 const workerSrc = `
 const lzTable = new Int32Array(1 << 16);
 ${encodeFrame}
+${DCT_SRC}
 ${lz4Block}
 let recon = null, partBytes = 0;
 const pack = (rec, useLz4) => { if (useLz4) { const c = lz4Block(rec); if (c.length < rec.length) return c; } return rec; };
 onmessage = e => {
   const m = e.data;
-  if (m.init) { recon = new Uint8Array(m.size); partBytes = 0; return; }
+  if (m.init) { recon = new Uint8Array(m.size); partBytes = 0; DW = m.w; DH = m.h; return; }
   const px = new Uint8ClampedArray(m.buf);
   let rec = encodeFrame(px, recon, m.key, m.tol, m.rgb), stored = pack(rec, m.lz4), newPart = false;
   if (partBytes > 0 && partBytes + stored.length > m.maxPart) {
@@ -438,6 +511,7 @@ const pworkerSrc = `
 const lzTable = new Int32Array(1 << 16);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 ${encodeFrame}
+${DCT_SRC}
 ${lz4Block}
 ${drawRotated}
 ${wasmEnc}
@@ -445,8 +519,9 @@ ${makeGpu}
 onmessage = e => run(e.data).catch(err => postMessage({ error: String((err && err.message) || err) }));
 async function run(m) {
   const { samples, ts, cfg, w, h, rot, fps, start, f0, f1, keyEvery, tol, rgb, lz4 } = m;
+  DW = w; DH = h;
   let enc = null, gpu = null;
-  if (m.useWasm) { try { enc = wasmEnc(m.wasm, w * h); } catch (e) { enc = null; } }
+  if (m.useWasm && rgb !== 3) { try { enc = wasmEnc(m.wasm, w * h); } catch (e) { enc = null; } }
   if (m.useGpu) { try { gpu = makeGpu(w, h, rot); } catch (e) { gpu = null; } }
   const ctx = new OffscreenCanvas(w, h).getContext('2d', { willReadFrequently: true });
   ctx.imageSmoothingQuality = 'high';
@@ -520,7 +595,7 @@ async function extractFramesParallel(onProgress) {
   const dm = await demux(fileObj);
   const { track, samples, rot } = dm, ts = track.timescale;
   const { w, h } = dims(), { start } = range(), fps = val('fps'), total = frameTotal();
-  const keyEvery = Math.max(1, Math.floor(val('keyEvery'))), tol = Math.max(0, val('tol'));
+  const keyEvery = Math.max(1, Math.floor(val('keyEvery'))), tol = $('dct').checked ? Math.max(1, val('qstep')) : Math.max(0, val('tol'));
   const rgb = pixFmt(), useLz4 = $('lz4').checked;
   const maxPart = Math.max(1, val('partMB')) * 1048576;
   const cfg = { codec: track.codec, codedWidth: track.video.width, codedHeight: track.video.height, description: getDescription(dm.mp4, track) };
@@ -610,7 +685,7 @@ async function extractFrames(onProgress) {
 
 async function extractFramesSerial(onProgress) {
   const { w, h } = dims(), { start } = range(), fps = val('fps'), total = frameTotal();
-  const keyEvery = Math.max(1, Math.floor(val('keyEvery'))), tol = Math.max(0, val('tol'));
+  const keyEvery = Math.max(1, Math.floor(val('keyEvery'))), tol = $('dct').checked ? Math.max(1, val('qstep')) : Math.max(0, val('tol'));
   const rgb = pixFmt(), useLz4 = $('lz4').checked;
   const maxPart = Math.max(1, val('partMB')) * 1048576;
   const cv = makeCanvas(w, h);
@@ -635,7 +710,7 @@ async function extractFramesSerial(onProgress) {
     if (batch.length >= 256) flush();
     inflight--; wake();
   };
-  worker.postMessage({ init: true, size: w * h * 4 });
+  worker.postMessage({ init: true, size: w * h * 4, w, h });
 
   // WebCodecs source (falls back to seeking if unsupported or demux fails)
   let dm = null, it = null, cur = null, nxt = null;
@@ -836,7 +911,7 @@ $('go').addEventListener('click', async () => {
     const one = fr.parts.length === 1;
     const pname = i => one ? 'video.bin' : `video_${String(i + 1).padStart(3, '0')}.bin`;
     const meta = {
-      format: ['rgba8-delta3', 'rgb8-delta3', 'rgb565-delta3'][fr.rgb], rgb: fr.rgb === 1, bpp: [4, 3, 2][fr.rgb], width: fr.width, height: fr.height,
+      format: ['rgba8-delta3', 'rgb8-delta3', 'rgb565-delta3', 'yuv420-dct8'][fr.rgb], rgb: fr.rgb === 1, bpp: [4, 3, 2, 0][fr.rgb], dct: fr.rgb === 3, q: val('qstep'), width: fr.width, height: fr.height,
       lz4: fr.lz4, maxRaw: fr.maxRaw, count: fr.count, fps: val('fps'), keyEvery: fr.keyEvery,
       videoBytes: fr.bytes,
       parts: fr.parts.map((p, i) => ({ name: pname(i), firstFrame: p.first, bytes: p.bytes })),
